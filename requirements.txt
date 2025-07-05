@@ -1,0 +1,8 @@
+# PyTorch는 위 명령어로 별도 설치합니다.
+# torch==1.12.1+cu113 --extra-index-url https://download.pytorch.org/whl/cu113
+
+transformers
+pandas
+scikit-learn
+tqdm
+wandb
