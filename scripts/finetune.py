@@ -55,7 +55,9 @@ def main() -> None:
     ap.add_argument("--seq_len", type=int, default=126)
     ap.add_argument("--batch_size", type=int, default=32)
     ap.add_argument("--epochs", type=int, default=3)
-    ap.add_argument("--lr", type=float, default=2e-5)
+    # ap.add_argument("--lr", type=float, default=2e-5)  # 단일 학습률 제거
+    ap.add_argument("--body_lr", type=float, default=2e-6, help="Learning rate for the pre-trained BERT body")
+    ap.add_argument("--head_lr", type=float, default=5e-5, help="Learning rate for the new classification head")
     args = ap.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -99,7 +101,16 @@ def main() -> None:
     }
     model.bert.load_state_dict(bert_sd, strict=False)
 
-    optim = torch.optim.AdamW(model.parameters(), lr=args.lr)
+    # 파라미터 그룹을 두 개로 분리하여 차등 학습률을 적용
+    optimizer_grouped_parameters = [
+        # 그룹 1: 사전 훈련된 BERT '몸통(Body)'. 낮은 학습률을 적용.
+        {'params': model.bert.parameters(), 'lr': args.body_lr},
+        
+        # 그룹 2: 새로 학습될 '분류 헤드(Head)'. 상대적으로 높은 학습률을 적용.
+        {'params': model.classifier.parameters(), 'lr': args.head_lr}
+    ]
+    # 분리된 그룹을 옵티마이저에 전달하여 초기화
+    optim = torch.optim.AdamW(optimizer_grouped_parameters)
     sched = get_linear_schedule_with_warmup(
         optim, 0, len(tr_loader) * args.epochs
     )
