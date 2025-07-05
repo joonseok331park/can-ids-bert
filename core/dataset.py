@@ -24,7 +24,7 @@ class MLMDataset(torch.utils.data.Dataset):
         self,
         sequences: Sequence[Sequence[int]],
         tokenizer: CANTokenizer,
-        mask_prob: float = 0.15,
+        mask_prob: float = 0.45,
     ) -> None:
         self.sequences = list(sequences)
         self.tokenizer = tokenizer

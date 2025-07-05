@@ -69,7 +69,7 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--epochs", type=int, default=5, help="Number of epochs")
     ap.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate")
     ap.add_argument("--warmup_steps", type=int, default=1000, help="Warmup steps")
-    ap.add_argument("--mask_prob", type=float, default=0.15, help="Mask probability")
+    ap.add_argument("--mask_prob", type=float, default=0.45, help="Mask probability")
 
     # Teacher 모델 크기
     ap.add_argument("--hidden_size", type=int, default=256, help="Hidden size")
