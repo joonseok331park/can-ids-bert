@@ -5,17 +5,16 @@ CAN-BERT 다중 파트 자동화 사전 훈련 스크립트 (DDP 지원)
 
 ▪ 22개로 분할된 데이터 파일을 순회하며 8-GPU DDP 훈련
 ▪ torchrun을 사용하여 각 데이터 파트마다 분산 훈련 실행
-▪ 체크포인트 기반 훈련 재개 지원
+▪ 항상 처음부터 새로운 훈련 시작 (체크포인트 재개 없음)
 """
 
 from __future__ import annotations
 
 import argparse
-import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List
 
 
 def _parse_args() -> argparse.Namespace:
@@ -48,17 +47,6 @@ def _discover_parts(parts_dir: Path, limit: int | None) -> List[Path]:
     return parts
 
 
-def _latest_checkpoint(ckpt_dir: Path) -> Tuple[int, Path | None]:
-    """가장 최신 체크포인트 찾기"""
-    latest = (-1, None)
-    pattern = re.compile(r"epoch-(\d+)\.pt$")
-    for f in ckpt_dir.glob("can-bert-pretrained-epoch-*.pt"):
-        m = pattern.search(f.name)
-        if m:
-            epoch = int(m.group(1))
-            if epoch > latest[0]:
-                latest = (epoch, f)
-    return latest
 
 
 def _run_command(cmd: list[str]) -> None:
@@ -110,22 +98,14 @@ def main():
     parts = _discover_parts(parts_dir, args.max_parts)
     print(f"[INFO] 총 {len(parts)}개의 데이터 파트를 대상으로 훈련을 시작합니다.")
     
-    # 최신 체크포인트 확인
-    latest_epoch, latest_ckpt = _latest_checkpoint(ckpt_dir)
-    if latest_ckpt:
-        print(f"[INFO] 최신 체크포인트 발견: {latest_ckpt} (epoch {latest_epoch})")
-    else:
-        print("[INFO] 기존 체크포인트가 없습니다. 처음부터 시작합니다.")
+    # 항상 처음부터 새로운 훈련 시작
+    print("[INFO] 새로운 훈련을 시작합니다 (기존 체크포인트 무시).")
 
     # 각 데이터 파트에 대해 DDP 훈련 실행
     for idx, part in enumerate(parts):
         start_epoch_for_part = idx * args.epochs_per_part
         end_epoch_for_part = start_epoch_for_part + args.epochs_per_part
         
-        # 이미 훈련된 파트인지 확인
-        if latest_epoch >= end_epoch_for_part:
-            print(f"✓ {part.name} → 이미 학습 완료 (현재 epoch {latest_epoch})")
-            continue
         
         print(f"\n{'='*60}")
         print(f"🚀 Part {idx+1}/{len(parts)}: {part.name}")
@@ -147,15 +127,12 @@ def main():
             "--seq_len", "126",
             "--batch_size", str(args.batch_size),  # GPU당 배치 크기
             "--epochs", str(args.epochs_per_part),
-            "--learning_rate", "5e-5",
+            "--learning_rate", "1e-3",
             "--num_workers", str(args.num_workers),
             "--dataset_type", "candump",
             "--seed", "42",  # 재현성을 위한 시드
         ]
         
-        # 체크포인트 재개
-        if latest_ckpt:
-            cmd_args += ["--resume_from_checkpoint", str(latest_ckpt)]
         
         # DDP 훈련 실행
         full_cmd = cmd_prefix + cmd_args
@@ -166,20 +143,10 @@ def main():
             print(f"❌ 오류 코드: {e.returncode}")
             sys.exit(1)
         
-        # 훈련 완료 후 체크포인트 확인
-        latest_epoch, latest_ckpt = _latest_checkpoint(ckpt_dir)
-        
-        if latest_epoch < end_epoch_for_part:
-            error_msg = f"[ERR] {part.name} 훈련 후 epoch {end_epoch_for_part} 체크포인트 생성 실패! (최신: {latest_epoch})"
-            print(f"❌ {error_msg}")
-            raise RuntimeError(error_msg)
-        
-        print(f"✅ {part.name} 훈련 완료 (epoch {latest_epoch})")
+        print(f"✅ {part.name} 훈련 완료")
 
     print("\n" + "="*60)
     print("🎉 모든 파트 학습 완료!")
-    print(f"🏁 최종 체크포인트: {latest_ckpt}")
-    print(f"🏁 최종 epoch: {latest_epoch}")
     print("="*60)
 
 
