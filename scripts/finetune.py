@@ -137,21 +137,29 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"[INFO] Using device: {device}")
     
-    # wandb 초기화
-    wandb.init(
-        project=args.wandb_project,
-        name=args.wandb_run_name,
-        config={
-            "epochs": args.epochs,
-            "batch_size": args.batch_size,
-            "seq_len": args.seq_len,
-            "body_lr": args.body_lr,
-            "head_lr": args.head_lr,
-            "pretrain_mask_ratio": 0.15,  # 명세서 요구사항
-            "model_architecture": "CAN-BERT",
-            "num_classes": 4,
-        }
-    )
+    # wandb 초기화 (오프라인 모드)
+    use_wandb = True
+    try:
+        wandb.init(
+            project=args.wandb_project,
+            name=args.wandb_run_name,
+            mode="offline",  # 오프라인 모드로 실행
+            config={
+                "epochs": args.epochs,
+                "batch_size": args.batch_size,
+                "seq_len": args.seq_len,
+                "body_lr": args.body_lr,
+                "head_lr": args.head_lr,
+                "pretrain_mask_ratio": 0.15,  # 명세서 요구사항
+                "model_architecture": "CAN-BERT",
+                "num_classes": 4,
+            }
+        )
+        print("[INFO] Wandb initialized in offline mode")
+    except Exception as e:
+        print(f"[WARNING] Wandb initialization failed: {e}")
+        print("[INFO] Continuing without wandb logging")
+        use_wandb = False
     
     # 토크나이저 로드
     print("[INFO] Loading tokenizer...")
@@ -191,7 +199,9 @@ def main() -> None:
     
     # BERT 몸통 가중치만 추출
     bert_state_dict = {}
-    for key, value in checkpoint["model_state"].items():
+    model_state = checkpoint.get("model", checkpoint)  # "model" 키 확인, 없으면 전체 사용
+    
+    for key, value in model_state.items():
         if key.startswith("bert."):
             # "bert." 접두사 제거
             new_key = key.replace("bert.", "")
@@ -275,16 +285,17 @@ def main() -> None:
         print(f"Val Loss: {val_loss:.4f}, Val F1: {val_metrics['f1_weighted']:.4f}")
         
         # wandb 로깅
-        wandb.log({
-            "epoch": epoch + 1,
-            "train/loss": avg_train_loss,
-            "train/f1_weighted": train_metrics['f1_weighted'],
-            "train/accuracy": train_metrics['accuracy'],
-            "val/loss": val_loss,
-            "val/f1_weighted": val_metrics['f1_weighted'],
-            "val/accuracy": val_metrics['accuracy'],
-            "learning_rate": scheduler.get_last_lr()[0],
-        })
+        if use_wandb:
+            wandb.log({
+                "epoch": epoch + 1,
+                "train/loss": avg_train_loss,
+                "train/f1_weighted": train_metrics['f1_weighted'],
+                "train/accuracy": train_metrics['accuracy'],
+                "val/loss": val_loss,
+                "val/f1_weighted": val_metrics['f1_weighted'],
+                "val/accuracy": val_metrics['accuracy'],
+                "learning_rate": scheduler.get_last_lr()[0],
+            })
         
         # 최적 모델 저장
         if val_metrics['f1_weighted'] > best_val_f1:
@@ -331,15 +342,15 @@ def main() -> None:
     print(classification_report(test_ground_truths, test_predictions, target_names=class_names))
     
     # wandb 최종 로깅
-    wandb.log({
-        "test/loss": test_loss,
-        "test/accuracy": test_metrics['accuracy'],
-        "test/f1_weighted": test_metrics['f1_weighted'],
-        "test/f1_macro": test_metrics['f1_macro'],
-        "best_val_f1": best_val_f1,
-    })
-    
-    wandb.finish()
+    if use_wandb:
+        wandb.log({
+            "test/loss": test_loss,
+            "test/accuracy": test_metrics['accuracy'],
+            "test/f1_weighted": test_metrics['f1_weighted'],
+            "test/f1_macro": test_metrics['f1_macro'],
+            "best_val_f1": best_val_f1,
+        })
+        wandb.finish()
     print(f"\n[INFO] Training completed. Best model saved at: {best_model_path}")
 
 

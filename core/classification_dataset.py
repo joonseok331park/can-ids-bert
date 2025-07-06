@@ -75,7 +75,8 @@ class ClassificationDataset(Dataset):
             # 시퀀스 길이 맞추기 (패딩 또는 절단)
             if len(encoded_tokens) < self.seq_len:
                 # 패딩
-                encoded_tokens.extend([self.tokenizer.get_pad_token_id()] * (self.seq_len - len(encoded_tokens)))
+                pad_token_id = self.tokenizer.token_to_id["<PAD>"]
+                encoded_tokens.extend([pad_token_id] * (self.seq_len - len(encoded_tokens)))
             else:
                 # 절단
                 encoded_tokens = encoded_tokens[:self.seq_len]
@@ -106,7 +107,7 @@ class ClassificationDataset(Dataset):
         label = self.labels[idx]
         
         # attention_mask 생성 (패딩이 아닌 토큰은 1, 패딩은 0)
-        pad_token_id = self.tokenizer.get_pad_token_id()
+        pad_token_id = self.tokenizer.token_to_id["<PAD>"]
         attention_mask = [1 if token_id != pad_token_id else 0 for token_id in sequence]
         
         return {
