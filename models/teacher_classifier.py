@@ -7,13 +7,13 @@ class CANBertForClassification(nn.Module):
     """
     사전 훈련된 CAN-BERT 모델 위에 분류 헤드를 추가한 미세 조정용 모델.
     """
-    def __init__(self, config: BertConfig, num_labels: int = 2):
+    def __init__(self, config: BertConfig, num_labels: int = 4):
         """
         모델을 초기화합니다.
 
         Args:
             config (BertConfig): 사전 훈련된 BERT 모델의 설정.
-            num_labels (int): 분류할 라벨의 수 (기본값: 2, 정상/공격).
+            num_labels (int): 분류할 라벨의 수 (기본값: 4, Benign/DoS/Fuzzy/Malfunction).
         """
         super().__init__()
         self.num_labels = num_labels

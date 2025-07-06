@@ -67,3 +67,60 @@ def load_can_data(path: str | Path, dataset_type: str = "candump") -> pd.DataFra
         }
     )
     return df[["Timestamp", "CAN_ID", "DLC", "Data", "Label"]]
+
+
+def load_classification_data(data_dir: str | Path) -> pd.DataFrame:
+    """
+    분류용 데이터 디렉토리 로드 (여러 클래스 파일들)
+    
+    Args:
+        data_dir: 데이터 디렉토리 경로 (Benign_*.log, DoS_*.log, Fuzzy_*.log, Malfunction_*.log 파일들 포함)
+        
+    Returns:
+        pd.DataFrame: 모든 파일의 데이터가 합쳐진 DataFrame with proper labels
+    """
+    data_dir = Path(data_dir)
+    if not data_dir.is_dir():
+        raise FileNotFoundError(f"Directory not found: {data_dir}")
+    
+    # 클래스 레이블 매핑
+    class_mapping = {
+        'Benign': 0,
+        'DoS': 1, 
+        'Fuzzy': 2,
+        'Malfunction': 3
+    }
+    
+    all_data = []
+    
+    # 각 클래스별 파일들 처리
+    for class_name, label in class_mapping.items():
+        class_files = list(data_dir.glob(f"{class_name}_*.log"))
+        print(f"Found {len(class_files)} files for {class_name} class")
+        
+        for file_path in class_files:
+            try:
+                # 개별 파일 로드
+                df = load_can_data(file_path)
+                # 라벨 설정
+                df['Label'] = label
+                all_data.append(df)
+                print(f"Loaded {len(df)} records from {file_path.name}")
+            except Exception as e:
+                print(f"Error loading {file_path.name}: {e}")
+    
+    if not all_data:
+        raise ValueError(f"No valid data files found in {data_dir}")
+    
+    # 모든 데이터 합치기
+    combined_df = pd.concat(all_data, ignore_index=True)
+    print(f"Total loaded records: {len(combined_df)}")
+    
+    # 클래스별 분포 출력
+    class_counts = combined_df['Label'].value_counts().sort_index()
+    print("Class distribution:")
+    for label, count in class_counts.items():
+        class_name = [k for k, v in class_mapping.items() if v == label][0]
+        print(f"  {class_name} ({label}): {count} records")
+    
+    return combined_df
