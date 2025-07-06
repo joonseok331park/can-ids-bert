@@ -67,9 +67,9 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--seq_len", type=int, default=126, help="Sequence length")
     ap.add_argument("--batch_size", type=int, default=64, help="Batch size per GPU")
     ap.add_argument("--epochs", type=int, default=5, help="Number of epochs")
-    ap.add_argument("--learning_rate", type=float, default=5e-5, help="Learning rate")
+    ap.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate for pre-training (1e-3 recommended by CAN-BERT paper)")
     ap.add_argument("--warmup_steps", type=int, default=1000, help="Warmup steps")
-    ap.add_argument("--mask_prob", type=float, default=0.45, help="Mask probability")
+    ap.add_argument("--mask_prob", type=float, default=0.45, help="Masking probability (0.45 recommended by CAN-BERT paper)")
 
     # Teacher 모델 크기
     ap.add_argument("--hidden_size", type=int, default=256, help="Hidden size")
