@@ -248,13 +248,14 @@ def _train_epoch(
         # 그래디언트 스케일링 및 역전파
         scaler.scale(loss).backward()
         
+        sched.step()
+        
         # 그래디언트 축적 단계에서만 옵티마이저 업데이트
         if (step + 1) % gradient_accumulation_steps == 0:
             scaler.unscale_(optim)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             scaler.step(optim)
             scaler.update()
-            sched.step()
             optim.zero_grad()
         
         total_loss += loss.item()
