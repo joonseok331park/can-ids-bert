@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "pdf-reader": {
+      "command": "npx",
+      "args": ["-y", "aistudio-mcp-server"],
+      "env": {
+        "GEMINI_API_KEY": "AIzaSyAFIpvgp2n4egoc4fhZuMCMzYhShjuNQAc"
+      }
+    }
+  }
+}

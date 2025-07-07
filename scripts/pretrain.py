@@ -78,7 +78,8 @@ def _parse_args() -> argparse.Namespace:
     ap.add_argument("--intermediate", type=int, default=512, help="Intermediate size")
 
     # 시스템
-    ap.add_argument("--num_workers", type=int, default=2, help="DataLoader workers")
+    ap.add_argument("--num_workers", type=int, default=os.cpu_count() // 2, help="DataLoader workers")
+    ap.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Gradient accumulation steps")
 
     return ap.parse_args()
 
@@ -160,7 +161,7 @@ def _build_loader(
         batch_size=args.batch_size,
         sampler=sampler,
         shuffle=shuffle,
-        num_workers=args.num_workers,
+        num_workers=args.num_workers or os.cpu_count() // 2,
         pin_memory=True,
         drop_last=True
     )
@@ -216,6 +217,7 @@ def _train_epoch(
     epoch: int,
     end_epoch: int,
     rank: int,
+    gradient_accumulation_steps: int = 1,
 ) -> None:
     """한 에포크 훈련"""
     model.train()
@@ -237,19 +239,23 @@ def _train_epoch(
         # 배치를 GPU로 이동
         batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
         
-        optim.zero_grad()
-        
         # Mixed Precision Training
         with autocast():
             loss = model(**batch)[0]
+            # 그래디언트 축적을 위한 손실 스케일링
+            loss = loss / gradient_accumulation_steps
         
         # 그래디언트 스케일링 및 역전파
         scaler.scale(loss).backward()
-        scaler.unscale_(optim)
-        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        scaler.step(optim)
-        scaler.update()
-        sched.step()
+        
+        # 그래디언트 축적 단계에서만 옵티마이저 업데이트
+        if (step + 1) % gradient_accumulation_steps == 0:
+            scaler.unscale_(optim)
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scaler.step(optim)
+            scaler.update()
+            sched.step()
+            optim.zero_grad()
         
         total_loss += loss.item()
         num_steps += 1
@@ -375,6 +381,12 @@ def main() -> None:
     # 모델 생성 및 GPU로 이동
     model = _build_model(tokenizer, args).to(device)
     
+    # torch.compile() 적용 (PyTorch 2.0+)
+    if hasattr(torch, 'compile') and torch.__version__.startswith('2.'):
+        model = torch.compile(model)
+        if rank == 0:
+            print("[INFO] Model compiled with torch.compile()")
+    
     # Optimizer & Scheduler 생성
     optim, sched = _build_optim_sched(model, args, steps_per_epoch)
     
@@ -411,7 +423,7 @@ def main() -> None:
         # 훈련
         _train_epoch(
             model, loader, optim, sched, scaler, 
-            device, epoch, target_epoch, rank
+            device, epoch, target_epoch, rank, args.gradient_accumulation_steps
         )
         
         # DDP 동기화 (모든 프로세스가 에포크 완료 대기)

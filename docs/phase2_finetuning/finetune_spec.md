@@ -17,9 +17,9 @@
 
 -   **목표:** 보유 중인 불완전 사전 훈련 모델(`epoch-14.pt`, `mask_ratio=0.15` 조건)을 사용하여, **End-to-End 미세 조정 파이프라인의 기술적 건전성을 검증**하고, 향후 모델 개선을 위한 **초기 성능 베이스라인을 확보**한다.
 -   **성공 기준 (Success Criteria):**
-    1.  `[ ]` `finetune.py` 스크립트가 데이터 로딩부터 훈련, 검증, 모델 저장까지 **오류 없이 완주**한다.
-    2.  `[ ]` `wandb`에 훈련/검증 손실, 학습률, 각 평가 지표가 **정상적으로 로깅**된다.
-    3.  `[ ]` `evaluate.py`를 통해 테스트셋에 대한 **최종 성능 리포트(F1, Precision, Recall, Confusion Matrix 등)가 성공적으로 산출**된다.
+    1.  `[x]` `finetune.py` 스크립트가 데이터 로딩부터 훈련, 검증, 모델 저장까지 **오류 없이 완주**한다.
+    2.  `[x]` `wandb`에 훈련/검증 손실, 학습률, 각 평가 지표가 **정상적으로 로깅**된다.
+    3.  `[x]` `evaluate.py`를 통해 테스트셋에 대한 **최종 성능 리포트(F1, Precision, Recall, Confusion Matrix 등)가 성공적으로 산출**된다.
 
 ##### **2.3.2. 데이터 파이프라인**
 
@@ -30,38 +30,38 @@
     -   `Fuzzy`: 2
     -   `Malfunction`: 3
 -   **데이터셋 클래스 (`ClassificationDataset`):** `torch.utils.data.Dataset`을 상속받는 새로운 `ClassificationDataset` 클래스를 `core/dataset.py`에 구현한다.
-    -   `[ ]` `__init__(self, data_dir, tokenizer, seq_len)`:
+    -   `[x]` `__init__(self, data_dir, tokenizer, seq_len)`:
         -   `data_dir` 내의 모든 로그/CSV 파일을 읽어들인다.
         -   파일명을 기준으로 각 데이터 라인에 레이블(0~3)을 부여한다.
         -   모든 (시퀀스, 레이블) 쌍을 메모리에 리스트 형태로 로드한다.
-    -   `[ ]` `__len__(self)`: 전체 데이터 샘플 수를 반환한다.
-    -   `[ ]` `__getitem__(self, idx)`:
+    -   `[x]` `__len__(self)`: 전체 데이터 샘플 수를 반환한다.
+    -   `[x]` `__getitem__(self, idx)`:
         -   `idx`에 해당하는 CAN 시퀀스를 토크나이징하고 `seq_len`에 맞게 패딩/절단한다.
         -   최종적으로 모델 입력 형식에 맞는 딕셔너리를 반환한다: `{'input_ids': torch.Tensor, 'attention_mask': torch.Tensor, 'labels': torch.LongTensor}`.
 
 ##### **2.3.3. 모델 아키텍처 및 가중치**
 
 -   **선별적 가중치 로딩 (Selective Weight Loading):**
-    -   `[ ]` `--resume_from_checkpoint` 인자로 받은 `epoch-14.pt` 파일의 `state_dict`를 로드한다.
+    -   `[x]` `--resume_from_checkpoint` 인자로 받은 `epoch-14.pt` 파일의 `state_dict`를 로드한다.
     -   **(주의) 이 체크포인트는 `mask_ratio=0.15` 조건으로 사전 훈련되었음을 명확히 인지한다.**
-    -   `[ ]` 로드된 `state_dict`는 `CANBertForMaskedLM`의 가중치이므로, 이 중 BERT '몸통'에 해당하는 부분(`bert.*`)의 가중치만 추출한다.
-    -   `[ ]` 새로 생성된 `CANBertForClassification` 인스턴스에 추출된 '몸통' 가중치만 주입한다. 모델의 `classifier` 레이어(분류 헤드)는 무작위 초기화 상태를 유지해야 한다.
+    -   `[x]` 로드된 `state_dict`는 `CANBertForMaskedLM`의 가중치이므로, 이 중 BERT '몸통'에 해당하는 부분(`bert.*`)의 가중치만 추출한다.
+    -   `[x]` 새로 생성된 `CANBertForClassification` 인스턴스에 추출된 '몸통' 가중치만 주입한다. 모델의 `classifier` 레이어(분류 헤드)는 무작위 초기화 상태를 유지해야 한다.
 
 ##### **2.3.4. 훈련 및 평가 로직**
 
--   **손실 함수 (Loss Function):** `[ ]` 클래스 불균형 문제를 다루기 위해 가중치(weight) 적용이 가능한 `torch.nn.CrossEntropyLoss`를 사용한다. `train` 데이터셋의 클래스별 샘플 수의 역수를 계산하여 `weight` 텐서를 생성하고, 손실 함수 초기화 시 전달하는 로직을 추가한다.
--   **옵티마이저 (Optimizer):** `[ ]` `torch.optim.AdamW`를 사용한다.
+-   **손실 함수 (Loss Function):** `[x]` 클래스 불균형 문제를 다루기 위해 가중치(weight) 적용이 가능한 `torch.nn.CrossEntropyLoss`를 사용한다. `train` 데이터셋의 클래스별 샘플 수의 역수를 계산하여 `weight` 텐서를 생성하고, 손실 함수 초기화 시 전달하는 로직을 추가한다.
+-   **옵티마이저 (Optimizer):** `[x]` `torch.optim.AdamW`를 사용한다.
 -   **차등 학습률 (Differential Learning Rate):**
-    -   `[ ]` **(필수 구현)** 옵티마이저에 두 개의 파라미터 그룹을 명시적으로 전달한다.
+    -   `[x]` **(필수 구현)** 옵티마이저에 두 개의 파라미터 그룹을 명시적으로 전달한다.
         -   **그룹 1 (BERT Body):** `model.bert.parameters()` - 낮은 학습률 적용. **(권장: `2e-6` ~ `1e-5`)**
         -   **그룹 2 (Classifier Head):** `model.classifier.parameters()` - 상대적으로 높은 학습률 적용. **(권장: `5e-5` ~ `1e-4`)**
--   **평가 지표 (Evaluation Metrics):** `[ ]` `scikit-learn`을 활용하여 아래 지표들을 계산한다: Accuracy, Precision, Recall, F1-Score (각 클래스별, 'weighted' 평균), Confusion Matrix.
+-   **평가 지표 (Evaluation Metrics):** `[x]` `scikit-learn`을 활용하여 아래 지표들을 계산한다: Accuracy, Precision, Recall, F1-Score (각 클래스별, 'weighted' 평균), Confusion Matrix.
 
 ##### **2.3.5. 실행 및 결과물**
 
--   **커맨드라인 인터페이스 (CLI):** `[ ]` `argparse`를 통해 다음을 인자로 받는다: `--train_data_dir`, `--val_data_dir`, `--test_data_dir`, `--vocab_path`, `--resume_from_checkpoint`, `--output_dir`, `--epochs`, `--batch_size`, `--seq_len`, `--body_lr`, `--head_lr`.
--   **체크포인트 저장:** `[ ]` 가장 높은 **validation F1-Score (weighted average)를 기록한 epoch**의 모델을 `output_dir`에 `pilot-finetuned-best.pt`로 저장한다.
--   **로깅:** `[ ]` `wandb`에 하이퍼파라미터와 모든 훈련/검증 결과를 기록한다. 특히, 사용된 교사 모델의 조건(`pretrain_mask_ratio: 0.15`)을 명시적으로 저장한다.
+-   **커맨드라인 인터페이스 (CLI):** `[x]` `argparse`를 통해 다음을 인자로 받는다: `--train_data_dir`, `--val_data_dir`, `--test_data_dir`, `--vocab_path`, `--resume_from_checkpoint`, `--output_dir`, `--epochs`, `--batch_size`, `--seq_len`, `--body_lr`, `--head_lr`.
+-   **체크포인트 저장:** `[x]` 가장 높은 **validation F1-Score (weighted average)를 기록한 epoch**의 모델을 `output_dir`에 `pilot-finetuned-best.pt`로 저장한다.
+-   **로깅:** `[x]` `wandb`에 하이퍼파라미터와 모든 훈련/검증 결과를 기록한다. 특히, 사용된 교사 모델의 조건(`pretrain_mask_ratio: 0.15`)을 명시적으로 저장한다.
 
 ---
 

@@ -199,3 +199,4 @@ dataset/
 checkpoints/*.pt
 wandb/
 tree_structure.txt
+node_modules
