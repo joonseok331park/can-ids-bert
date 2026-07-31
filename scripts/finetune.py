@@ -1,8 +1,6 @@
 # scripts/finetune.py
 # -*- coding: utf-8 -*-
-"""
-CAN-BERT 4클래스 분류용 미세 조정 스크립트 (명세서 v2.2 준수)
-"""
+"""CAN-BERT 4클래스 분류용 미세 조정 스크립트."""
 
 from __future__ import annotations
 
@@ -150,7 +148,6 @@ def main() -> None:
                 "seq_len": args.seq_len,
                 "body_lr": args.body_lr,
                 "head_lr": args.head_lr,
-                "pretrain_mask_ratio": 0.15,  # 명세서 요구사항
                 "model_architecture": "CAN-BERT",
                 "num_classes": 4,
             }

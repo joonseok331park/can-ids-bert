@@ -17,6 +17,10 @@
 
 지식 증류와 경량 학생 모델은 참고 논문을 바탕으로 검토한 후속 방향이며, 현재 저장소에는 구현되어 있지 않습니다.
 
+## 저장소 상태와 검증 범위
+
+이 저장소는 실험 과정의 코드 스냅샷이며, 유지보수되는 자동화 테스트 스위트를 제공하지 않습니다. 데이터 없이 실행할 수 있는 `compileall` 검사는 Python 문법만 확인하며, 학습 파이프라인의 동작이나 결과 재현을 검증하지 않습니다. 전체 실행에는 별도로 확보한 데이터, 호환되는 PyTorch·Transformers 환경과 GPU 설정이 필요합니다.
+
 ## 처리 흐름
 
 ```text
@@ -146,7 +150,7 @@ checkpoints/vocab.json
 
 ### MLM 사전 학습
 
-`scripts.pretrain`은 단일 프로세스 실행과 `torchrun` 실행 인자를 모두 제공하지만, 현재 혼합 정밀도·체크포인트 경로는 CUDA/DDP 사용을 중심으로 작성되어 있습니다. 다음은 분할 데이터 하나를 GPU 한 장에서 확인하는 명령 예시입니다.
+현재 문서화한 사전 학습 경로는 Linux, CUDA, NCCL 환경에서의 `torchrun` 실행입니다. 코드에 일반 Python 실행 분기가 남아 있지만 CPU 실행이나 `python -m scripts.pretrain` 단독 실행을 지원·검증된 경로로 보지 않습니다. 다음 명령은 환경을 구성한 뒤 분할 데이터 하나로 실행 흐름을 확인하기 위한 예시입니다.
 
 ```bash
 torchrun --standalone --nproc_per_node=1 -m scripts.pretrain --data_path data/aggregated_parts/part_00 --vocab_path checkpoints/vocab.json --output_dir checkpoints --epochs 1 --batch_size 32 --num_workers 4
@@ -183,7 +187,6 @@ checkpoints/pilot-finetuned-best.pt
 - `dataset/`, 생성된 `data/`, 학습 체크포인트(`*.pt`)는 Git 추적 대상이 아닙니다.
 - 공개 저장소에는 학습 결과 수치가 없으므로 정확도, F1, 지연 시간에 대한 결과를 제시하지 않습니다.
 - `scripts.run_full_training`은 여러 데이터 파트를 순회하기 위한 실험용 자동화 스크립트입니다. 위 빠른 시작에서는 입력과 체크포인트가 명시적인 `scripts.pretrain` 경로를 사용합니다.
-- `scripts.evaluate`는 별도의 탐색용 평가 스크립트이며, 문서화된 경로에서는 `scripts.finetune`에 포함된 test 평가를 사용합니다.
 - 이 코드는 연구용 프로토타입으로, 안전이 중요한 실제 차량 시스템에 바로 배포하기 위한 구현이 아닙니다.
 
 ## 참고 논문

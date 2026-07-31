@@ -1,4 +1,4 @@
-# scripts/pretrain.py (모든 문제 해결된 최종 버전)
+# CAN-BERT 사전 학습 실험 스크립트
 # -*- coding: utf-8 -*-
 """
 CAN‑BERT 사전 훈련 스크립트 (기본 DDP 지원)
