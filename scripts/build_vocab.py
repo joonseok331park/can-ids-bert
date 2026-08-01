@@ -1,52 +1,77 @@
-# scripts/build_vocab.py
-# -*- coding: utf-8 -*-
-"""
-대용량 candump 로그 → vocab.json (동적 id_offset 사용)
-"""
+"""Build a tokenizer vocabulary with the canonical candump parser."""
 
 from __future__ import annotations
 
-import re
+import argparse
 from pathlib import Path
 from typing import Set
 
-from tqdm import tqdm
-
 from core.tokenizer import CANTokenizer
+from utils.data_loader import ParseStats, parse_candump_line
 
-_LINE_RE = re.compile(r"\(\d+\.\d+\)\s+\w+\s+([0-9A-F]+)#")
+
+def _collect_unique_ids(path: Path) -> tuple[Set[str], ParseStats]:
+    """Return canonical IDs and scan counts, rejecting all-invalid input."""
+    if not path.is_file():
+        raise FileNotFoundError(path)
+
+    unique_ids: Set[str] = set()
+    total_lines = 0
+    rejected_lines = 0
+    with path.open(encoding="utf-8") as stream:
+        for line in stream:
+            total_lines += 1
+            record = parse_candump_line(line)
+            if record is None:
+                rejected_lines += 1
+                continue
+            unique_ids.add(record["CAN_ID"])
+
+    stats = ParseStats(
+        total_lines=total_lines,
+        valid_lines=total_lines - rejected_lines,
+        rejected_lines=rejected_lines,
+    )
+    if not unique_ids:
+        raise ValueError(
+            f"No valid candump frames in {path} "
+            f"(total={stats.total_lines}, rejected={stats.rejected_lines})"
+        )
+    return unique_ids, stats
 
 
-def _collect_unique_ids(path: Path) -> Set[str]:
-    uniq: Set[str] = set()
-    with path.open(encoding="utf-8") as fp:
-        total = sum(1 for _ in fp)
-        fp.seek(0)
-        for line in tqdm(fp, total=total, desc="Scanning IDs"):
-            m = _LINE_RE.match(line)
-            if m:
-                uniq.add(m.group(1))
-    return uniq
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--data-file",
+        type=Path,
+        default=Path("data/HCRL_dataset/train_aggregated.log"),
+    )
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=Path("checkpoints/vocab.json"),
+    )
+    return parser.parse_args()
 
 
 def main() -> None:
-    data_file = Path("data/HCRL_dataset/train_aggregated.log")
-    out_dir = Path("checkpoints")
-    out_dir.mkdir(parents=True, exist_ok=True)
-    vocab_path = out_dir / "vocab.json"
-
-    ids = _collect_unique_ids(data_file)
-    print(f"[INFO] unique CAN IDs: {len(ids):,}")
-
-    tok = CANTokenizer()  # 00~FF 데이터 토큰 및 특수 토큰 자동 포함
-    tok._add_tokens(  # 내부 메서드 사용 허용 – 프로젝트 컨벤션
-        [
-            str(int(cid, 16) + tok.id_offset)
-            for cid in sorted(ids, key=lambda value: int(value, 16))
-        ]
+    args = _parse_args()
+    ids, stats = _collect_unique_ids(args.data_file)
+    print(
+        "[INFO] parser counts: "
+        f"valid={stats.valid_lines:,}, rejected={stats.rejected_lines:,}, "
+        f"total={stats.total_lines:,}"
     )
-    tok.save_vocab(vocab_path)
-    print(f"[INFO] vocab saved → {vocab_path}  (size={tok.vocab_size:,})")
+
+    tokenizer = CANTokenizer()
+    tokenizer.add_can_ids(ids)
+    args.output.parent.mkdir(parents=True, exist_ok=True)
+    tokenizer.save_vocab(str(args.output))
+    print(
+        f"[INFO] vocab saved -> {args.output} "
+        f"(CAN IDs={len(ids):,}, size={tokenizer.vocab_size:,})"
+    )
 
 
 if __name__ == "__main__":

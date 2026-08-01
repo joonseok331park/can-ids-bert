@@ -1,148 +1,296 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-미세 조정용 데이터 준비 스크립트
-CAN-MIRGU 데이터를 4클래스로 분류하여 train/validation/test 폴더에 배치
-"""
+"""Create deterministic file-level train, validation, and test splits."""
 
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
 import os
+import random
 import shutil
 from pathlib import Path
-import random
-from typing import Dict, List, Tuple
+from typing import Dict, Iterable, List, Tuple
 
-def classify_attack_files(attack_dir: Path) -> Dict[str, List[Path]]:
+from core.classes import CLASS_NAMES
+
+
+SPLIT_NAMES = ("train", "validation", "test")
+MANIFEST_NAME = "split_manifest.json"
+
+
+def _sorted_logs(directory: Path) -> list[Path]:
+    if not directory.is_dir():
+        return []
+    return sorted(
+        directory.rglob("*.log"),
+        key=lambda path: path.relative_to(directory).as_posix().casefold(),
+    )
+
+
+def classify_source_files(dataset_dir: Path) -> Dict[str, List[Path]]:
+    """Classify source files and reject ambiguous real-attack filenames.
+
+    Benign files come from ``Benign``. Real-attack filenames must contain
+    ``dos``, ``fuzz``, or ``malfunction``. Files under ``Masquerade_attacks``
+    and ``Suspension_attacks`` are explicitly mapped to Malfunction.
     """
-    공격 파일들을 4클래스로 분류
-    
-    Returns:
-        Dict[str, List[Path]]: 클래스별 파일 목록
-    """
-    classification = {
-        'Benign': [],
-        'DoS': [],
-        'Fuzzy': [],
-        'Malfunction': []
+    dataset_dir = dataset_dir.resolve()
+    if not dataset_dir.is_dir():
+        raise FileNotFoundError(dataset_dir)
+
+    classified: Dict[str, List[Path]] = {name: [] for name in CLASS_NAMES}
+    classified["Benign"].extend(_sorted_logs(dataset_dir / "Benign"))
+
+    unclassified: list[Path] = []
+    for path in _sorted_logs(dataset_dir / "Attack" / "Real_attacks"):
+        filename = path.name.casefold()
+        matches = []
+        if "dos" in filename:
+            matches.append("DoS")
+        if "fuzz" in filename:
+            matches.append("Fuzzy")
+        if "malfunction" in filename:
+            matches.append("Malfunction")
+        if len(matches) != 1:
+            unclassified.append(path)
+        else:
+            classified[matches[0]].append(path)
+
+    for directory_name in ("Masquerade_attacks", "Suspension_attacks"):
+        classified["Malfunction"].extend(
+            _sorted_logs(dataset_dir / "Attack" / directory_name)
+        )
+
+    if unclassified:
+        relative = [
+            path.relative_to(dataset_dir).as_posix() for path in unclassified
+        ]
+        raise ValueError(
+            "Unclassified attack files; rename or extend the documented rule: "
+            + ", ".join(relative)
+        )
+
+    for class_name in CLASS_NAMES:
+        classified[class_name] = sorted(
+            classified[class_name],
+            key=lambda path: path.relative_to(dataset_dir).as_posix().casefold(),
+        )
+    return classified
+
+
+def split_files(
+    files: Iterable[Path],
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    seed: int = 42,
+) -> Tuple[List[Path], List[Path], List[Path]]:
+    """Split at file level while keeping every split non-empty."""
+    files = sorted((Path(path) for path in files), key=lambda path: path.as_posix())
+    if len(files) < 3:
+        raise ValueError(
+            f"At least 3 source files per class are required; found {len(files)}"
+        )
+    if train_ratio <= 0 or val_ratio <= 0 or train_ratio + val_ratio >= 1:
+        raise ValueError("Ratios must be positive and leave a positive test ratio")
+
+    shuffled = files.copy()
+    random.Random(seed).shuffle(shuffled)
+    train_count = max(1, int(len(shuffled) * train_ratio))
+    validation_count = max(1, int(len(shuffled) * val_ratio))
+    while len(shuffled) - train_count - validation_count < 1:
+        if train_count >= validation_count and train_count > 1:
+            train_count -= 1
+        elif validation_count > 1:
+            validation_count -= 1
+        else:
+            raise ValueError("Unable to keep every split non-empty")
+
+    train = shuffled[:train_count]
+    validation = shuffled[train_count : train_count + validation_count]
+    test = shuffled[train_count + validation_count :]
+    split_sets = [set(group) for group in (train, validation, test)]
+    if any(
+        split_sets[left] & split_sets[right]
+        for left in range(len(split_sets))
+        for right in range(left + 1, len(split_sets))
+    ):
+        raise AssertionError("A source file appears in more than one split")
+    return train, validation, test
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _prepare_output_dir(output_dir: Path, overwrite: bool) -> None:
+    if not output_dir.exists():
+        output_dir.mkdir(parents=True)
+        return
+    if not output_dir.is_dir():
+        raise NotADirectoryError(output_dir)
+
+    existing = list(output_dir.iterdir())
+    if existing and not overwrite:
+        raise FileExistsError(
+            f"Output directory is not empty: {output_dir}; use --overwrite"
+        )
+    allowed = set(SPLIT_NAMES) | {MANIFEST_NAME}
+    unexpected = sorted(path.name for path in existing if path.name not in allowed)
+    if unexpected:
+        raise FileExistsError(
+            "Refusing to overwrite a directory with unrelated entries: "
+            + ", ".join(unexpected)
+        )
+    for path in existing:
+        if path.is_dir():
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+
+def _materialize(source: Path, target: Path, link_mode: str) -> str:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if link_mode == "copy":
+        shutil.copy2(source, target)
+        return "copy"
+    if link_mode == "symlink":
+        os.symlink(source.resolve(), target)
+        return "symlink"
+    try:
+        os.symlink(source.resolve(), target)
+        return "symlink"
+    except OSError:
+        shutil.copy2(source, target)
+        return "copy"
+
+
+def prepare_splits(
+    dataset_dir: Path,
+    output_dir: Path,
+    train_ratio: float = 0.7,
+    val_ratio: float = 0.15,
+    seed: int = 42,
+    overwrite: bool = False,
+    link_mode: str = "auto",
+) -> dict:
+    """Prepare split files and write ``split_manifest.json``."""
+    if link_mode not in {"auto", "copy", "symlink"}:
+        raise ValueError("link_mode must be auto, copy, or symlink")
+    dataset_dir = dataset_dir.resolve()
+    output_dir = output_dir.resolve()
+    if output_dir == dataset_dir or dataset_dir in output_dir.parents:
+        raise ValueError("Output directory must not be inside the source dataset")
+
+    classified = classify_source_files(dataset_dir)
+    planned: dict[str, dict[str, list[Path]]] = {}
+    for class_index, class_name in enumerate(CLASS_NAMES):
+        files = classified[class_name]
+        if len(files) < 3:
+            raise ValueError(
+                f"Class {class_name} requires at least 3 files; found {len(files)}"
+            )
+        groups = split_files(files, train_ratio, val_ratio, seed + class_index)
+        planned[class_name] = dict(zip(SPLIT_NAMES, groups))
+
+    every_source: list[Path] = [
+        source
+        for class_splits in planned.values()
+        for sources in class_splits.values()
+        for source in sources
+    ]
+    if len(every_source) != len(set(every_source)):
+        raise AssertionError("A source file appears in more than one split")
+    for class_name, class_splits in planned.items():
+        for split_name in SPLIT_NAMES:
+            if not class_splits[split_name]:
+                raise AssertionError(
+                    f"Class {class_name} is absent from split {split_name}"
+                )
+
+    _prepare_output_dir(output_dir, overwrite)
+    entries = []
+    for class_name in CLASS_NAMES:
+        for split_name in SPLIT_NAMES:
+            for index, source in enumerate(planned[class_name][split_name], start=1):
+                target_name = f"{class_name}_{index:03d}_{source.stem}.log"
+                target = output_dir / split_name / target_name
+                materialization = _materialize(source, target, link_mode)
+                entries.append(
+                    {
+                        "class": class_name,
+                        "split": split_name,
+                        "source_relative_path": source.relative_to(
+                            dataset_dir
+                        ).as_posix(),
+                        "target_relative_path": target.relative_to(
+                            output_dir
+                        ).as_posix(),
+                        "materialization": materialization,
+                        "source_sha256": _sha256(source),
+                    }
+                )
+
+    manifest = {
+        "schema_version": 1,
+        "seed": seed,
+        "ratios": {
+            "train": train_ratio,
+            "validation": val_ratio,
+            "test": 1.0 - train_ratio - val_ratio,
+        },
+        "classification_rules": {
+            "Benign": "files under Benign",
+            "DoS": "Real_attacks filename contains dos",
+            "Fuzzy": "Real_attacks filename contains fuzz",
+            "Malfunction": (
+                "Real_attacks filename contains malfunction, or file is under "
+                "Masquerade_attacks/Suspension_attacks"
+            ),
+        },
+        "entries": entries,
     }
-    
-    # Real_attacks 디렉토리 파일들 분류
-    real_attacks_dir = attack_dir / 'Real_attacks'
-    if real_attacks_dir.exists():
-        for file_path in real_attacks_dir.glob('*.log'):
-            filename = file_path.name.lower()
-            if 'dos' in filename:
-                classification['DoS'].append(file_path)
-            elif 'fuzz' in filename:
-                classification['Fuzzy'].append(file_path)
-            else:
-                classification['Malfunction'].append(file_path)
-    
-    # Masquerade_attacks와 Suspension_attacks도 Malfunction으로 분류
-    for subdir in ['Masquerade_attacks', 'Suspension_attacks']:
-        subdir_path = attack_dir / subdir
-        if subdir_path.exists():
-            for file_path in subdir_path.glob('*.log'):
-                classification['Malfunction'].append(file_path)
-    
-    return classification
+    (output_dir / MANIFEST_NAME).write_text(
+        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return manifest
 
-def get_benign_files(benign_dir: Path) -> List[Path]:
-    """
-    정상 데이터 파일들 수집
-    """
-    benign_files = []
-    for day_dir in benign_dir.glob('Day_*'):
-        for file_path in day_dir.glob('*.log'):
-            benign_files.append(file_path)
-    return benign_files
 
-def split_files(files: List[Path], train_ratio: float = 0.7, val_ratio: float = 0.15) -> Tuple[List[Path], List[Path], List[Path]]:
-    """
-    파일들을 train/validation/test로 분할
-    """
-    random.seed(42)  # 재현 가능한 결과를 위해
-    files_shuffled = files.copy()
-    random.shuffle(files_shuffled)
-    
-    n_total = len(files_shuffled)
-    n_train = int(n_total * train_ratio)
-    n_val = int(n_total * val_ratio)
-    
-    train_files = files_shuffled[:n_train]
-    val_files = files_shuffled[n_train:n_train + n_val]
-    test_files = files_shuffled[n_train + n_val:]
-    
-    return train_files, val_files, test_files
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--dataset-dir", type=Path, default=Path("dataset/CAN-MIRGU(train)")
+    )
+    parser.add_argument(
+        "--output-dir", type=Path, default=Path("data/finetune_data")
+    )
+    parser.add_argument("--train-ratio", type=float, default=0.7)
+    parser.add_argument("--val-ratio", type=float, default=0.15)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--overwrite", action="store_true")
+    parser.add_argument(
+        "--link-mode", choices=("auto", "copy", "symlink"), default="auto"
+    )
+    return parser.parse_args()
 
-def copy_files_to_split(files: List[Path], target_dir: Path, class_name: str):
-    """
-    파일들을 대상 디렉토리로 복사 (심볼릭 링크 사용으로 효율성 향상)
-    """
-    target_dir.mkdir(parents=True, exist_ok=True)
-    
-    for i, file_path in enumerate(files):
-        target_file = target_dir / f"{class_name}_{i+1:03d}_{file_path.stem}.log"
-        try:
-            # 심볼릭 링크 생성 (디스크 공간 절약)
-            if not target_file.exists():
-                os.symlink(file_path.absolute(), target_file)
-                print(f"Linked: {file_path.name} -> {target_file.name}")
-        except OSError:
-            # 심볼릭 링크 실패 시 복사
-            shutil.copy2(file_path, target_file)
-            print(f"Copied: {file_path.name} -> {target_file.name}")
 
-def main():
-    # 데이터 경로 설정
-    dataset_dir = Path('dataset/CAN-MIRGU(train)')
-    finetune_data_dir = Path('data/finetune_data')
-    
-    # 클래스별 파일 분류
-    print("=== 데이터 파일 분류 ===")
-    
-    # 공격 데이터 분류
-    attack_dir = dataset_dir / 'Attack'
-    attack_classification = classify_attack_files(attack_dir)
-    
-    # 정상 데이터 수집
-    benign_dir = dataset_dir / 'Benign'
-    benign_files = get_benign_files(benign_dir)
-    attack_classification['Benign'] = benign_files
-    
-    # 클래스별 파일 개수 출력
-    for class_name, files in attack_classification.items():
-        print(f"{class_name}: {len(files)} files")
-    
-    # 각 클래스별로 train/validation/test 분할
-    print("\n=== 데이터 분할 및 복사 ===")
-    
-    for class_name, files in attack_classification.items():
-        if not files:
-            print(f"Warning: No files found for class {class_name}")
-            continue
-            
-        # 파일 분할
-        train_files, val_files, test_files = split_files(files)
-        
-        print(f"\n{class_name} 클래스:")
-        print(f"  Train: {len(train_files)} files")
-        print(f"  Validation: {len(val_files)} files")
-        print(f"  Test: {len(test_files)} files")
-        
-        # 파일 복사
-        copy_files_to_split(train_files, finetune_data_dir / 'train', class_name)
-        copy_files_to_split(val_files, finetune_data_dir / 'validation', class_name)
-        copy_files_to_split(test_files, finetune_data_dir / 'test', class_name)
-    
-    print("\n=== 데이터 준비 완료 ===")
-    print(f"데이터가 {finetune_data_dir} 디렉토리에 준비되었습니다.")
-    
-    # 최종 통계 출력
-    for split in ['train', 'validation', 'test']:
-        split_dir = finetune_data_dir / split
-        if split_dir.exists():
-            file_count = len(list(split_dir.glob('*.log')))
-            print(f"{split}: {file_count} files")
+def main() -> None:
+    args = _parse_args()
+    manifest = prepare_splits(
+        args.dataset_dir,
+        args.output_dir,
+        args.train_ratio,
+        args.val_ratio,
+        args.seed,
+        args.overwrite,
+        args.link_mode,
+    )
+    print(f"[INFO] wrote {len(manifest['entries'])} split entries")
+
 
 if __name__ == "__main__":
     main()
