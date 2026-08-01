@@ -50,7 +50,7 @@ class MLMDataset(torch.utils.data.Dataset):
         cand_idx = [
             i for i, tid in enumerate(seq) if tid not in self._special_ids
         ]
-        num_mask = max(1, int(len(cand_idx) * self.mask_prob))
+        num_mask = min(len(cand_idx), max(1, int(len(cand_idx) * self.mask_prob)))
         for i in random.sample(cand_idx, num_mask):
             labels[i] = seq[i]
             rand = random.random()

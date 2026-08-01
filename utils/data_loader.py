@@ -14,21 +14,27 @@ import pandas as pd
 from tqdm import tqdm
 
 _LINE_RE = re.compile(
-    r"\((?P<ts>\d+\.\d+)\)\s+\w+\s+(?P<cid>[0-9A-F]+)#(?P<payload>[0-9A-F]*)"
+    r"\((?P<ts>\d+\.\d+)\)\s+"
+    r"[A-Z0-9_.:-]+\s+"
+    r"(?P<cid>[0-9A-F]{1,8})#(?P<payload>[0-9A-F]*)",
+    re.IGNORECASE,
 )
 
 
 def _parse(line: str) -> Optional[Dict]:
-    m = _LINE_RE.match(line)
+    m = _LINE_RE.fullmatch(line.strip())
     if not m:
         return None
     ts = float(m.group("ts"))
-    cid = m.group("cid")
+    cid = m.group("cid").upper()
     payload_hex = m.group("payload")
+    if int(cid, 16) > 0x1FFFFFFF:
+        return None
+    if len(payload_hex) % 2 or len(payload_hex) > 16:
+        return None
     data = [
         payload_hex[i : i + 2].upper()
         for i in range(0, len(payload_hex), 2)
-        if payload_hex
     ]
     return {
         "Timestamp": ts,

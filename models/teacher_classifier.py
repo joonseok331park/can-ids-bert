@@ -23,7 +23,7 @@ class CANBertForClassification(nn.Module):
         self.bert = BertModel(config)
         # 드롭아웃 레이어
         self.dropout = nn.Dropout(config.hidden_dropout_prob)
-        # BERT의 [CLS] 토큰 출력을 받아 라벨 수만큼의 출력으로 변환하는 분류 레이어
+        # 첫 위치의 pooled representation을 라벨 수만큼의 출력으로 변환
         self.classifier = nn.Linear(config.hidden_size, num_labels)
 
     def forward(self, input_ids, attention_mask=None, labels=None):
@@ -44,8 +44,7 @@ class CANBertForClassification(nn.Module):
             attention_mask=attention_mask
         )
 
-        # BERT의 출력 중 [CLS] 토큰에 해당하는 벡터를 사용합니다.
-        # 이 벡터는 전체 시퀀스의 의미를 요약하는 역할을 합니다.
+        # 기본 tokenizer에는 별도 CLS token이 없으므로 첫 위치의 pooled output을 사용합니다.
         pooled_output = outputs[1]
         pooled_output = self.dropout(pooled_output)
         

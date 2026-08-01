@@ -21,7 +21,7 @@ dist/
 
 data/
 dataset/
-checkpoints/*.pt
+/checkpoints/
 wandb/
 *.log
 
@@ -30,6 +30,9 @@ node_modules/
 .claude/
 .kilocode/
 .codex/
+AGENTS.md
+CLAUDE.md
+GEMINI.md
 
 .idea/
 .vscode/

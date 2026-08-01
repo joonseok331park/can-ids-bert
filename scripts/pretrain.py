@@ -203,6 +203,19 @@ def _build_optim_sched(
     return optim, sched
 
 
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Return the underlying model behind DDP and torch.compile wrappers."""
+    while True:
+        if isinstance(model, DDP):
+            model = model.module
+            continue
+        original = getattr(model, "_orig_mod", None)
+        if isinstance(original, torch.nn.Module):
+            model = original
+            continue
+        return model
+
+
 # --------------------------------------------------------------------------- #
 # 2. DDP 훈련 루프                                                             #
 # --------------------------------------------------------------------------- #
@@ -281,7 +294,7 @@ def _train_epoch(
 
 
 def _save_checkpoint(
-    model: DDP,
+    model: torch.nn.Module,
     optim: torch.optim.Optimizer,
     sched: torch.optim.lr_scheduler.LambdaLR,
     epoch: int,
@@ -295,11 +308,11 @@ def _save_checkpoint(
     out_dir.mkdir(parents=True, exist_ok=True)
     ckpt_path = out_dir / f"can-bert-pretrained-epoch-{epoch+1}.pt"
     
-    # DDP 모델의 실제 모델 state_dict 저장
+    # Wrapper 접두사가 없는 state dict를 저장해 fine-tuning과 재개에서 공유합니다.
     torch.save(
         {
             "epoch": epoch + 1,  # 다음 epoch부터 재개
-            "model": model.module.state_dict(),  # DDP에서는 .module 필요
+            "model": _unwrap_model(model).state_dict(),
             "optim_state": optim.state_dict(),
             "sched_state": sched.state_dict(),
         },
@@ -328,8 +341,8 @@ def _load_checkpoint(
     # 모든 rank에서 체크포인트 로드
     ckpt = torch.load(ckpt_path, map_location=device)
     
-    # 모델 상태 로드
-    model.load_state_dict(ckpt["model"])
+    # compile/DDP wrapper가 아닌 원본 모듈에 상태를 로드합니다.
+    _unwrap_model(model).load_state_dict(ckpt["model"])
     
     # Optimizer, Scheduler는 새로운 데이터에 맞춰 재생성되므로
     # 이전 상태는 로드하지 않음 (사용자 요구사항에 따라)
