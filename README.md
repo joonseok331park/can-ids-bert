@@ -79,14 +79,14 @@ python -m scripts.prepare_finetune_data \
   --dataset-dir "dataset/CAN-MIRGU(train)" \
   --output-dir data/finetune_data \
   --seed 42 --train-ratio 0.7 --val-ratio 0.15 \
-  --link-mode auto
+  --link-mode copy
 ```
 
-`split_manifest.json`에는 class, split, source relative path, target relative path, materialization 방식, source SHA-256, seed와 ratio가 기록됩니다. `Real_attacks` 파일명은 `dos`, `fuzz`, `malfunction` 중 정확히 한 규칙에 일치해야 합니다. `Masquerade_attacks`와 `Suspension_attacks` 디렉터리는 Malfunction으로 분류합니다. 그 밖의 파일은 자동으로 Malfunction에 넣지 않고 오류로 보고합니다.
+`split_manifest.json`에는 class, split, source relative path, target relative path, materialization 방식, source SHA-256, ratio와 클래스별 유효 seed가 기록됩니다. 유효 seed는 기본 seed에 고정된 `CLASS_NAMES` index를 더해 계산합니다. `Real_attacks` 파일명은 `dos`, `fuzz`, `malfunction` 중 정확히 한 규칙에 일치해야 합니다. `Masquerade_attacks`와 `Suspension_attacks` 디렉터리는 Malfunction으로 분류합니다. 그 밖의 파일은 자동으로 Malfunction에 넣지 않고 오류로 보고합니다.
 
 정렬·최소 개수·고정 seed 규칙을 적용한 split은 이전 스크립트의 결과와 달라질 수 있으므로 기존 실험과 별도 lineage로 취급합니다.
 
-같은 출력의 재생성을 명시하려면 위 데이터 준비 명령에 `--overwrite`를 추가합니다. 관련 없는 파일이 있는 출력 디렉터리는 덮어쓰지 않습니다.
+같은 출력의 재생성을 명시하려면 위 데이터 준비 명령에 `--overwrite`를 추가합니다. 이때 기존 트리 전체가 manifest에 기록된 파일과 정확히 일치해야 하며, 중첩된 미등록 파일이나 누락된 파일이 있으면 중단합니다. 새 split은 형제 staging 디렉터리에 모두 만든 뒤 교체하므로 생성 실패 시 기존 출력은 유지됩니다.
 
 ## 사전 학습과 체크포인트
 
@@ -103,7 +103,7 @@ torchrun --standalone --nproc_per_node=1 -m scripts.pretrain \
   --gradient_accumulation_steps 4
 ```
 
-Schema version 2 체크포인트는 model, optimizer, scheduler, AMP scaler, 다음 epoch, global optimizer step, model/training config를 저장합니다. 같은 architecture와 schedule로 계속하려면 다음과 같이 full-state resume을 사용합니다.
+Schema version 2 체크포인트는 model, optimizer, scheduler, AMP scaler, 다음 epoch, global optimizer step, model/training config를 저장합니다. Training config에는 vocabulary와 dataset 내용의 SHA-256, masking 확률, batch size, seed, world size, AMP 여부, sequence 길이와 dataset type이 포함됩니다. Resume은 이 값과 forward semantics에 영향을 주는 model config가 모두 같고 scheduler step이 global optimizer step과 일치할 때만 허용됩니다. 같은 입력과 설정으로 계속하려면 다음과 같이 full-state resume을 사용합니다.
 
 ```bash
 torchrun --standalone --nproc_per_node=1 -m scripts.pretrain \
@@ -152,7 +152,7 @@ Smoke test는 parser/tokenizer/dataset의 기본 동작과 teacher/classifier CP
 python -m unittest tests.test_data_pipeline tests.test_models -v
 ```
 
-Training/data integrity test는 accumulation 잔여 update, scheduler/global-step 수, AMP overflow, DDP `no_sync`, checkpoint round trip·migration·불일치 거부, file boundary, missing class, empty loader, deterministic manifest·overwrite 정책을 합성 입력으로 확인합니다.
+Training/data integrity test는 accumulation 잔여 update, scheduler/global-step 수, AMP overflow, DDP `no_sync`, checkpoint round trip·한 update 연속성·입력 hash 불일치 거부, file boundary, missing class, empty loader, deterministic manifest·안전한 overwrite 정책을 합성 입력으로 확인합니다.
 
 ```bash
 python -m unittest \
@@ -165,7 +165,7 @@ python -m unittest \
 전체 검사:
 
 ```bash
-python -m compileall core models scripts utils
+python -m compileall core models scripts utils tests
 python -m unittest discover -s tests -v
 ```
 

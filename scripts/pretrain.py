@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import os
 import random
@@ -28,6 +29,42 @@ from utils.data_loader import load_can_data
 
 CHECKPOINT_SCHEMA_VERSION = 2
 CHECKPOINT_TYPE = "can-bert-pretrain"
+TRAINING_CONFIG_REQUIRED_KEYS = (
+    "microbatches_per_epoch",
+    "gradient_accumulation_steps",
+    "updates_per_epoch",
+    "total_epochs",
+    "total_optimizer_steps",
+    "warmup_steps",
+    "learning_rate",
+    "mask_prob",
+    "batch_size",
+    "seed",
+    "world_size",
+    "amp_enabled",
+    "seq_len",
+    "dataset_type",
+    "vocab_sha256",
+    "dataset_sha256",
+)
+MODEL_CONFIG_REQUIRED_KEYS = (
+    "vocab_size",
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "intermediate_size",
+    "hidden_act",
+    "hidden_dropout_prob",
+    "attention_probs_dropout_prob",
+    "max_position_embeddings",
+    "type_vocab_size",
+    "initializer_range",
+    "layer_norm_eps",
+    "pad_token_id",
+    "position_embedding_type",
+    "use_cache",
+    "tie_word_embeddings",
+)
 
 
 @dataclass(frozen=True)
@@ -351,7 +388,42 @@ def _model_config(model: torch.nn.Module) -> dict[str, Any]:
     config = getattr(_unwrap_model(model), "config", None)
     if config is None or not hasattr(config, "to_dict"):
         return {}
-    return config.to_dict()
+    serialized = config.to_dict()
+    serialized.setdefault(
+        "position_embedding_type",
+        getattr(config, "position_embedding_type", "absolute"),
+    )
+    return serialized
+
+
+def _require_mapping(value: Any, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise IncompatibleCheckpointError(f"{label} must be a mapping")
+    return value
+
+
+def _non_negative_int(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise IncompatibleCheckpointError(f"{label} must be a non-negative integer")
+    return value
+
+
+def _validate_scheduler_global_step(
+    scheduler_state: Any, global_optimizer_step: Any
+) -> int:
+    state = _require_mapping(scheduler_state, "Scheduler state")
+    global_step = _non_negative_int(
+        global_optimizer_step, "Global optimizer step"
+    )
+    last_epoch = _non_negative_int(
+        state.get("last_epoch"), "Scheduler last_epoch"
+    )
+    if last_epoch != global_step:
+        raise IncompatibleCheckpointError(
+            "Scheduler state is incompatible with global optimizer step: "
+            f"last_epoch={last_epoch}, global_optimizer_step={global_step}"
+        )
+    return global_step
 
 
 def _save_checkpoint(
@@ -369,6 +441,15 @@ def _save_checkpoint(
     if rank != 0:
         return None
 
+    epoch = _non_negative_int(epoch, "Epoch index")
+    scheduler_state = sched.state_dict()
+    global_optimizer_step = _validate_scheduler_global_step(
+        scheduler_state, global_optimizer_step
+    )
+    _validate_training_config(training_config, None)
+    model_config = _model_config(model)
+    _validate_model_config(model_config, model_config)
+
     out_dir.mkdir(parents=True, exist_ok=True)
     checkpoint_path = out_dir / f"can-bert-pretrained-epoch-{epoch + 1}.pt"
     torch.save(
@@ -379,9 +460,9 @@ def _save_checkpoint(
             "global_optimizer_step": global_optimizer_step,
             "model_state_dict": _unwrap_model(model).state_dict(),
             "optimizer_state_dict": optim.state_dict(),
-            "scheduler_state_dict": sched.state_dict(),
+            "scheduler_state_dict": scheduler_state,
             "scaler_state_dict": scaler.state_dict(),
-            "model_config": _model_config(model),
+            "model_config": model_config,
             "training_config": dict(training_config),
         },
         checkpoint_path,
@@ -424,11 +505,40 @@ def _move_optimizer_state(
         optimizer.state[parameter] = _move_value_to_device(state, device)
 
 
-def _validate_training_config(
-    stored: Mapping[str, Any], expected: Mapping[str, Any] | None
-) -> None:
+def _valid_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.casefold()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _validate_training_config(stored: Any, expected: Any | None) -> None:
+    stored = _require_mapping(stored, "Training configuration")
+    missing = [key for key in TRAINING_CONFIG_REQUIRED_KEYS if key not in stored]
+    if missing:
+        raise IncompatibleCheckpointError(
+            "Training configuration is incomplete: " + ", ".join(missing)
+        )
+    for hash_key in ("vocab_sha256", "dataset_sha256"):
+        if not _valid_sha256(stored[hash_key]):
+            raise IncompatibleCheckpointError(
+                f"Training configuration has invalid {hash_key}"
+            )
     if expected is None:
         return
+    expected = _require_mapping(expected, "Expected training configuration")
+    missing = [key for key in TRAINING_CONFIG_REQUIRED_KEYS if key not in expected]
+    if missing:
+        raise IncompatibleCheckpointError(
+            "Expected training configuration is incomplete: " + ", ".join(missing)
+        )
+    for hash_key in ("vocab_sha256", "dataset_sha256"):
+        if not _valid_sha256(expected[hash_key]):
+            raise IncompatibleCheckpointError(
+                f"Expected training configuration has invalid {hash_key}"
+            )
     mismatches = [
         key
         for key, expected_value in expected.items()
@@ -440,23 +550,29 @@ def _validate_training_config(
             for key in mismatches
         )
         raise IncompatibleCheckpointError(
-            "Training schedule is incompatible with the checkpoint: " + details
+            "Training configuration is incompatible with the checkpoint: " + details
         )
 
 
-def _validate_model_config(
-    stored: Mapping[str, Any], current: Mapping[str, Any]
-) -> None:
-    architecture_keys = (
-        "vocab_size",
-        "hidden_size",
-        "num_hidden_layers",
-        "num_attention_heads",
-        "intermediate_size",
-        "max_position_embeddings",
-    )
+def _validate_model_config(stored: Any, current: Any) -> None:
+    stored = _require_mapping(stored, "Checkpoint model configuration")
+    current = _require_mapping(current, "Current model configuration")
+    stored_missing = [key for key in MODEL_CONFIG_REQUIRED_KEYS if key not in stored]
+    current_missing = [key for key in MODEL_CONFIG_REQUIRED_KEYS if key not in current]
+    if stored_missing or current_missing:
+        details = []
+        if stored_missing:
+            details.append("checkpoint missing " + ", ".join(stored_missing))
+        if current_missing:
+            details.append("current model missing " + ", ".join(current_missing))
+        raise IncompatibleCheckpointError(
+            "Model architecture is incompatible with the checkpoint: "
+            + "; ".join(details)
+        )
     mismatches = [
-        key for key in architecture_keys if stored.get(key) != current.get(key)
+        key
+        for key in MODEL_CONFIG_REQUIRED_KEYS
+        if stored[key] != current[key]
     ]
     if mismatches:
         details = ", ".join(
@@ -483,7 +599,7 @@ def _load_checkpoint(
     checkpoint_path = Path(ckpt_path)
     if not checkpoint_path.is_file():
         raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
 
     schema_version = (
         checkpoint.get("schema_version") if isinstance(checkpoint, Mapping) else None
@@ -529,6 +645,19 @@ def _load_checkpoint(
         raise IncompatibleCheckpointError(
             f"Unexpected checkpoint type: {checkpoint['checkpoint_type']!r}"
         )
+    for key in (
+        "model_state_dict",
+        "optimizer_state_dict",
+        "scheduler_state_dict",
+        "scaler_state_dict",
+        "model_config",
+        "training_config",
+    ):
+        _require_mapping(checkpoint[key], f"Checkpoint field {key}")
+    start_epoch = _non_negative_int(checkpoint["epoch"], "Checkpoint epoch")
+    global_step = _validate_scheduler_global_step(
+        checkpoint["scheduler_state_dict"], checkpoint["global_optimizer_step"]
+    )
     _validate_training_config(
         checkpoint["training_config"], expected_training_config
     )
@@ -547,12 +676,7 @@ def _load_checkpoint(
             f"Versioned checkpoint state is incompatible: {error}"
         ) from error
 
-    start_epoch = int(checkpoint["epoch"])
-    global_step = int(checkpoint["global_optimizer_step"])
-    if start_epoch < 0 or global_step < 0:
-        raise IncompatibleCheckpointError(
-            "Checkpoint epoch and global optimizer step must be non-negative"
-        )
+    _validate_scheduler_global_step(sched.state_dict(), global_step)
     if rank == 0:
         print(
             f"[TRUE RESUME] epoch={start_epoch}, "
@@ -561,9 +685,23 @@ def _load_checkpoint(
     return ResumeState(start_epoch, global_step, "true-resume")
 
 
+def _sha256_file(path: str | Path) -> str:
+    source = Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    digest = hashlib.sha256()
+    with source.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _training_config(
-    args: argparse.Namespace, microbatches_per_epoch: int
-) -> dict[str, int | float]:
+    args: argparse.Namespace,
+    microbatches_per_epoch: int,
+    world_size: int,
+    scaler: Any,
+) -> dict[str, Any]:
     updates_per_epoch = _optimizer_updates_per_epoch(
         microbatches_per_epoch, args.gradient_accumulation_steps
     )
@@ -575,6 +713,15 @@ def _training_config(
         "total_optimizer_steps": updates_per_epoch * args.epochs,
         "warmup_steps": args.warmup_steps,
         "learning_rate": args.learning_rate,
+        "mask_prob": args.mask_prob,
+        "batch_size": args.batch_size,
+        "seed": args.seed,
+        "world_size": world_size,
+        "amp_enabled": bool(scaler.is_enabled()),
+        "seq_len": args.seq_len,
+        "dataset_type": args.dataset_type,
+        "vocab_sha256": _sha256_file(args.vocab_path),
+        "dataset_sha256": _sha256_file(args.data_path),
     }
 
 
@@ -611,7 +758,9 @@ def main() -> None:
 
     optim, sched = _build_optim_sched(model, args, microbatches_per_epoch)
     scaler = _build_grad_scaler(device)
-    training_config = _training_config(args, microbatches_per_epoch)
+    training_config = _training_config(
+        args, microbatches_per_epoch, world_size, scaler
+    )
 
     resume_state = ResumeState(0, 0, "new-run")
     if args.resume_from_checkpoint:

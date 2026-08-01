@@ -1,6 +1,8 @@
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 import torch
 from transformers import BertConfig
@@ -18,6 +20,7 @@ from scripts.pretrain import (
     _build_grad_scaler,
     _load_checkpoint,
     _save_checkpoint,
+    _training_config,
 )
 
 
@@ -30,6 +33,29 @@ def tiny_config():
         intermediate_size=32,
         max_position_embeddings=16,
     )
+
+
+def full_training_config(**overrides):
+    config = {
+        "microbatches_per_epoch": 2,
+        "gradient_accumulation_steps": 2,
+        "updates_per_epoch": 1,
+        "total_epochs": 2,
+        "total_optimizer_steps": 2,
+        "warmup_steps": 0,
+        "learning_rate": 0.001,
+        "mask_prob": 0.45,
+        "batch_size": 2,
+        "seed": 42,
+        "world_size": 1,
+        "amp_enabled": False,
+        "seq_len": 16,
+        "dataset_type": "candump",
+        "vocab_sha256": "a" * 64,
+        "dataset_sha256": "b" * 64,
+    }
+    config.update(overrides)
+    return config
 
 
 class CheckpointTests(unittest.TestCase):
@@ -82,16 +108,57 @@ class CheckpointTests(unittest.TestCase):
         scaler = _build_grad_scaler(torch.device("cpu"))
         return model, optimizer, scheduler, scaler
 
-    def test_versioned_checkpoint_round_trip_restores_full_state(self):
-        model, optimizer, scheduler, scaler = self._training_parts()
-        input_ids = torch.randint(0, 32, (2, 8))
-        attention_mask = torch.ones_like(input_ids)
-        labels = input_ids.clone()
-        loss = model(input_ids, attention_mask, labels)[0]
-        loss.backward()
+    def _advance_one_update(self, model, optimizer, scheduler):
+        for parameter in model.parameters():
+            parameter.grad = torch.ones_like(parameter)
         optimizer.step()
         scheduler.step()
-        training_config = {"updates_per_epoch": 3, "total_epochs": 2}
+        optimizer.zero_grad(set_to_none=True)
+
+    def test_training_config_hashes_vocab_and_dataset_contents(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vocab_path = root / "vocab.json"
+            data_path = root / "train.log"
+            vocab_bytes = b'{"tokens": ["A", "B"]}\n'
+            data_bytes = b"(1.000000) can0 123#00\n"
+            vocab_path.write_bytes(vocab_bytes)
+            data_path.write_bytes(data_bytes)
+            args = SimpleNamespace(
+                gradient_accumulation_steps=2,
+                epochs=3,
+                warmup_steps=1,
+                learning_rate=0.001,
+                mask_prob=0.45,
+                batch_size=2,
+                seed=42,
+                seq_len=16,
+                dataset_type="candump",
+                vocab_path=str(vocab_path),
+                data_path=str(data_path),
+            )
+            config = _training_config(
+                args,
+                microbatches_per_epoch=5,
+                world_size=2,
+                scaler=_build_grad_scaler(torch.device("cpu")),
+            )
+
+        self.assertEqual(config["updates_per_epoch"], 3)
+        self.assertEqual(config["total_optimizer_steps"], 9)
+        self.assertEqual(
+            config["vocab_sha256"], hashlib.sha256(vocab_bytes).hexdigest()
+        )
+        self.assertEqual(
+            config["dataset_sha256"], hashlib.sha256(data_bytes).hexdigest()
+        )
+        self.assertEqual(config["world_size"], 2)
+        self.assertFalse(config["amp_enabled"])
+
+    def test_versioned_checkpoint_round_trip_restores_full_state(self):
+        model, optimizer, scheduler, scaler = self._training_parts()
+        self._advance_one_update(model, optimizer, scheduler)
+        training_config = full_training_config()
 
         with tempfile.TemporaryDirectory() as tmp:
             path = _save_checkpoint(
@@ -100,7 +167,7 @@ class CheckpointTests(unittest.TestCase):
                 scheduler,
                 scaler,
                 epoch=0,
-                global_optimizer_step=3,
+                global_optimizer_step=1,
                 out_dir=Path(tmp),
                 rank=0,
                 training_config=training_config,
@@ -121,7 +188,7 @@ class CheckpointTests(unittest.TestCase):
 
         self.assertEqual(state.mode, "true-resume")
         self.assertEqual(state.start_epoch, 1)
-        self.assertEqual(state.global_optimizer_step, 3)
+        self.assertEqual(state.global_optimizer_step, 1)
         self.assertEqual(restored_scheduler.last_epoch, scheduler.last_epoch)
         for key, value in model.state_dict().items():
             self.assertTrue(torch.equal(value, restored_model.state_dict()[key]))
@@ -134,6 +201,18 @@ class CheckpointTests(unittest.TestCase):
                 if torch.is_tensor(tensor)
             )
         )
+
+        self._advance_one_update(model, optimizer, scheduler)
+        self._advance_one_update(
+            restored_model, restored_optimizer, restored_scheduler
+        )
+        self.assertEqual(scheduler.last_epoch, 2)
+        self.assertEqual(restored_scheduler.last_epoch, 2)
+        self.assertEqual(scheduler.get_last_lr(), restored_scheduler.get_last_lr())
+        for source, restored in zip(
+            model.parameters(), restored_model.parameters(), strict=True
+        ):
+            torch.testing.assert_close(source, restored)
 
     def test_legacy_checkpoint_is_an_explicit_warm_start(self):
         source, _, _, _ = self._training_parts()
@@ -185,6 +264,8 @@ class CheckpointTests(unittest.TestCase):
 
     def test_schedule_mismatch_is_rejected(self):
         model, optimizer, scheduler, scaler = self._training_parts()
+        self._advance_one_update(model, optimizer, scheduler)
+        training_config = full_training_config()
         with tempfile.TemporaryDirectory() as tmp:
             path = _save_checkpoint(
                 model,
@@ -192,13 +273,13 @@ class CheckpointTests(unittest.TestCase):
                 scheduler,
                 scaler,
                 epoch=0,
-                global_optimizer_step=0,
+                global_optimizer_step=1,
                 out_dir=Path(tmp),
                 rank=0,
-                training_config={"updates_per_epoch": 3},
+                training_config=training_config,
             )
             with self.assertRaisesRegex(
-                IncompatibleCheckpointError, "Training schedule is incompatible"
+                IncompatibleCheckpointError, "Training configuration is incompatible"
             ):
                 _load_checkpoint(
                     model,
@@ -208,11 +289,62 @@ class CheckpointTests(unittest.TestCase):
                     path,
                     torch.device("cpu"),
                     rank=0,
-                    expected_training_config={"updates_per_epoch": 4},
+                    expected_training_config=full_training_config(
+                        updates_per_epoch=2, total_optimizer_steps=4
+                    ),
                 )
 
-    def test_shape_compatible_architecture_mismatch_is_rejected(self):
+    def test_scheduler_and_global_step_mismatch_is_rejected(self):
         model, optimizer, scheduler, scaler = self._training_parts()
+        training_config = full_training_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(
+                IncompatibleCheckpointError, "Scheduler state is incompatible"
+            ):
+                _save_checkpoint(
+                    model,
+                    optimizer,
+                    scheduler,
+                    scaler,
+                    epoch=0,
+                    global_optimizer_step=1,
+                    out_dir=Path(tmp),
+                    rank=0,
+                    training_config=training_config,
+                )
+
+            self._advance_one_update(model, optimizer, scheduler)
+            path = _save_checkpoint(
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch=0,
+                global_optimizer_step=1,
+                out_dir=Path(tmp),
+                rank=0,
+                training_config=training_config,
+            )
+            payload = torch.load(path, map_location="cpu")
+            payload["global_optimizer_step"] = 2
+            torch.save(payload, path)
+
+            restored = self._training_parts()
+            with self.assertRaisesRegex(
+                IncompatibleCheckpointError, "Scheduler state is incompatible"
+            ):
+                _load_checkpoint(
+                    *restored,
+                    path,
+                    torch.device("cpu"),
+                    rank=0,
+                    expected_training_config=training_config,
+                )
+
+    def test_resume_rejects_changed_or_missing_content_hashes(self):
+        model, optimizer, scheduler, scaler = self._training_parts()
+        self._advance_one_update(model, optimizer, scheduler)
+        training_config = full_training_config()
         with tempfile.TemporaryDirectory() as tmp:
             path = _save_checkpoint(
                 model,
@@ -220,13 +352,112 @@ class CheckpointTests(unittest.TestCase):
                 scheduler,
                 scaler,
                 epoch=0,
-                global_optimizer_step=0,
+                global_optimizer_step=1,
                 out_dir=Path(tmp),
                 rank=0,
-                training_config={},
+                training_config=training_config,
+            )
+            payload = torch.load(path, map_location="cpu")
+
+            for hash_key in ("vocab_sha256", "dataset_sha256"):
+                with self.subTest(hash_key=hash_key):
+                    expected = full_training_config(**{hash_key: "c" * 64})
+                    restored = self._training_parts()
+                    with self.assertRaisesRegex(
+                        IncompatibleCheckpointError, hash_key
+                    ):
+                        _load_checkpoint(
+                            *restored,
+                            path,
+                            torch.device("cpu"),
+                            rank=0,
+                            expected_training_config=expected,
+                        )
+
+            missing_payload = dict(payload)
+            missing_payload["training_config"] = dict(
+                payload["training_config"]
+            )
+            missing_payload["training_config"].pop("dataset_sha256")
+            missing_path = Path(tmp) / "missing-hash.pt"
+            torch.save(missing_payload, missing_path)
+            restored = self._training_parts()
+            with self.assertRaisesRegex(
+                IncompatibleCheckpointError, "Training configuration is incomplete"
+            ):
+                _load_checkpoint(
+                    *restored,
+                    missing_path,
+                    torch.device("cpu"),
+                    rank=0,
+                    expected_training_config=training_config,
+                )
+
+    def test_versioned_config_fields_require_mappings(self):
+        model, optimizer, scheduler, scaler = self._training_parts()
+        self._advance_one_update(model, optimizer, scheduler)
+        training_config = full_training_config()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _save_checkpoint(
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch=0,
+                global_optimizer_step=1,
+                out_dir=Path(tmp),
+                rank=0,
+                training_config=training_config,
+            )
+            payload = torch.load(path, map_location="cpu")
+            for field in ("training_config", "model_config"):
+                with self.subTest(field=field):
+                    malformed = dict(payload)
+                    malformed[field] = []
+                    malformed_path = Path(tmp) / f"malformed-{field}.pt"
+                    torch.save(malformed, malformed_path)
+                    restored = self._training_parts()
+                    with self.assertRaisesRegex(
+                        IncompatibleCheckpointError, "must be a mapping"
+                    ):
+                        _load_checkpoint(
+                            *restored,
+                            malformed_path,
+                            torch.device("cpu"),
+                            rank=0,
+                            expected_training_config=training_config,
+                        )
+
+            restored = self._training_parts()
+            with self.assertRaisesRegex(
+                IncompatibleCheckpointError,
+                "Expected training configuration must be a mapping",
+            ):
+                _load_checkpoint(
+                    *restored,
+                    path,
+                    torch.device("cpu"),
+                    rank=0,
+                    expected_training_config=[],
+                )
+
+    def test_shape_compatible_architecture_mismatch_is_rejected(self):
+        model, optimizer, scheduler, scaler = self._training_parts()
+        self._advance_one_update(model, optimizer, scheduler)
+        with tempfile.TemporaryDirectory() as tmp:
+            path = _save_checkpoint(
+                model,
+                optimizer,
+                scheduler,
+                scaler,
+                epoch=0,
+                global_optimizer_step=1,
+                out_dir=Path(tmp),
+                rank=0,
+                training_config=full_training_config(),
             )
             payload = torch.load(path)
-            payload["model_config"]["num_attention_heads"] = 4
+            payload["model_config"]["hidden_act"] = "relu"
             torch.save(payload, path)
             with self.assertRaisesRegex(
                 IncompatibleCheckpointError, "Model architecture is incompatible"
