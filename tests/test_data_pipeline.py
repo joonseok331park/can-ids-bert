@@ -6,7 +6,8 @@ import pandas as pd
 
 from core.dataset import MLMDataset
 from core.tokenizer import CANSequencer, CANTokenizer, SpecialToken
-from utils.data_loader import _parse, load_can_data
+from scripts.build_vocab import _collect_unique_ids
+from utils.data_loader import _parse, load_can_data, parse_candump_line
 
 
 class CandumpParserTests(unittest.TestCase):
@@ -42,6 +43,34 @@ class CandumpParserTests(unittest.TestCase):
             frame = load_can_data(path)
         self.assertEqual(len(frame), 1)
         self.assertEqual(frame.iloc[0]["CAN_ID"], "123")
+        self.assertEqual(
+            frame.attrs["parse_stats"],
+            {"total_lines": 2, "valid_lines": 1, "rejected_lines": 1},
+        )
+
+    def test_lowercase_uses_the_same_canonical_parser_for_vocab(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "sample.log"
+            path.write_text(
+                "(1.000000) can0 0a#00ff\n"
+                "(2.000000) can0 20000000#00\n"
+                "trailing garbage\n",
+                encoding="utf-8",
+            )
+            ids, stats = _collect_unique_ids(path)
+        self.assertEqual(ids, {"0A"})
+        self.assertEqual(stats.valid_lines, 1)
+        self.assertEqual(stats.rejected_lines, 2)
+        self.assertEqual(parse_candump_line("(1.0) can0 0a#00ff")["CAN_ID"], "0A")
+
+    def test_all_invalid_files_fail_for_loader_and_vocab(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "invalid.log"
+            path.write_text("invalid\n(1.0) can0 20000000#00\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "No valid candump frames"):
+                load_can_data(path)
+            with self.assertRaisesRegex(ValueError, "No valid candump frames"):
+                _collect_unique_ids(path)
 
 
 class TokenizerAndDatasetTests(unittest.TestCase):
@@ -74,6 +103,15 @@ class TokenizerAndDatasetTests(unittest.TestCase):
         ]
         assigned = [tokenizer.token_to_id[token] for token in tokens]
         self.assertEqual(assigned, sorted(assigned))
+
+    def test_public_add_can_ids_deduplicates_and_validates(self):
+        tokenizer = CANTokenizer()
+        added = tokenizer.add_can_ids(["00a", "A", "001"])
+        self.assertEqual(added, 2)
+        with self.assertRaises(ValueError):
+            tokenizer.add_can_ids(["20000000"])
+        with self.assertRaises(ValueError):
+            tokenizer.add_can_ids(["not-hex"])
 
     def test_payload_validation(self):
         tokenizer = CANTokenizer()
