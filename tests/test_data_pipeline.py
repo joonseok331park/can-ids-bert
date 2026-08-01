@@ -62,6 +62,19 @@ class TokenizerAndDatasetTests(unittest.TestCase):
         self.assertEqual(len(first), 1)
         self.assertEqual(len(first[0]), 18)
 
+    def test_vocab_orders_can_ids_numerically(self):
+        frame = pd.DataFrame(
+            {"CAN_ID": ["00F", "001", "00A"], "Data": [[], [], []]}
+        )
+        tokenizer = CANTokenizer()
+        tokenizer.build_vocab(frame)
+        tokens = [
+            str(tokenizer.id_offset + value)
+            for value in (0x001, 0x00A, 0x00F)
+        ]
+        assigned = [tokenizer.token_to_id[token] for token in tokens]
+        self.assertEqual(assigned, sorted(assigned))
+
     def test_payload_validation(self):
         tokenizer = CANTokenizer()
         sequencer = CANSequencer(tokenizer)

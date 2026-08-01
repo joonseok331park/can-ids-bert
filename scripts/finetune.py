@@ -27,6 +27,61 @@ from core.tokenizer import CANTokenizer
 from models.teacher_classifier import CANBertForClassification
 
 
+def _normalize_model_key(key: str) -> str:
+    """Remove wrapper prefixes that do not belong to the saved architecture."""
+    prefixes = ("module.", "_orig_mod.")
+    while key.startswith(prefixes):
+        key = key.split(".", 1)[1]
+    return key
+
+
+def _load_pretrained_bert(
+    model: CANBertForClassification,
+    model_state: Dict[str, torch.Tensor],
+) -> int:
+    """Load a complete, shape-compatible BERT body or fail explicitly."""
+    candidates = {}
+    for key, value in model_state.items():
+        normalized = _normalize_model_key(key)
+        if normalized.startswith("bert."):
+            candidates[normalized.removeprefix("bert.")] = value
+
+    expected = model.bert.state_dict()
+    compatible = {
+        key: value
+        for key, value in candidates.items()
+        if key in expected and value.shape == expected[key].shape
+    }
+    missing = sorted(set(expected) - set(compatible))
+    if missing:
+        raise RuntimeError(
+            "Pretrained checkpoint does not contain a complete compatible BERT body "
+            f"({len(missing)} tensors missing or shape-mismatched)."
+        )
+
+    result = model.bert.load_state_dict(compatible, strict=True)
+    if result.missing_keys or result.unexpected_keys:
+        raise RuntimeError("Pretrained BERT state failed strict validation.")
+    return len(compatible)
+
+
+def _finetune_checkpoint_payload(
+    model: CANBertForClassification,
+    optimizer: torch.optim.Optimizer,
+    epoch: int,
+    val_f1: float,
+    config: BertConfig,
+) -> Dict:
+    """Build a weights-only-safe fine-tuning checkpoint payload."""
+    return {
+        "epoch": epoch,
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "val_f1": val_f1,
+        "config": config.to_dict(),
+    }
+
+
 def calculate_class_weights(dataset: ClassificationDataset) -> torch.Tensor:
     """
     클래스 불균형 대응을 위한 가중치 계산
@@ -194,19 +249,11 @@ def main() -> None:
     print(f"[INFO] Loading pretrained weights from {args.resume_from_checkpoint}")
     checkpoint = torch.load(args.resume_from_checkpoint, map_location=device)
     
-    # BERT 몸통 가중치만 추출
-    bert_state_dict = {}
     model_state = checkpoint.get("model", checkpoint)  # "model" 키 확인, 없으면 전체 사용
-    
-    for key, value in model_state.items():
-        if key.startswith("bert."):
-            # "bert." 접두사 제거
-            new_key = key.replace("bert.", "")
-            bert_state_dict[new_key] = value
-    
-    # BERT 몸통에만 가중치 로드 (분류 헤드는 무작위 초기화 유지)
-    model.bert.load_state_dict(bert_state_dict, strict=False)
-    print("[INFO] Successfully loaded pretrained BERT weights")
+
+    # BERT 몸통 전체가 일치할 때만 로드하고 분류 헤드는 무작위 초기화로 둡니다.
+    loaded_tensors = _load_pretrained_bert(model, model_state)
+    print(f"[INFO] Loaded {loaded_tensors} pretrained BERT tensors")
     
     # 손실 함수 (클래스 불균형 대응)
     criterion = nn.CrossEntropyLoss(weight=class_weights)
@@ -300,13 +347,12 @@ def main() -> None:
             best_model_path = Path(args.output_dir) / f"pilot-finetuned-best.pt"
             best_model_path.parent.mkdir(parents=True, exist_ok=True)
             
-            torch.save({
-                'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'val_f1': best_val_f1,
-                'config': config,
-            }, best_model_path)
+            torch.save(
+                _finetune_checkpoint_payload(
+                    model, optimizer, epoch + 1, best_val_f1, config
+                ),
+                best_model_path,
+            )
             
             print(f"[INFO] New best model saved: {best_model_path}")
     

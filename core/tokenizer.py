@@ -97,8 +97,11 @@ class CANTokenizer:
 
     # ---------- 주요 API ---------- #
     def build_vocab(self, df: pd.DataFrame) -> None:
-        """DataFrame 내 고유 CAN ID ↗ ID 토큰 추가"""
-        uniq_ids = df["CAN_ID"].unique()
+        """DataFrame 내 고유 CAN ID ↗ ID 토큰 추가"""
+        uniq_ids = sorted(
+            {str(can_id).upper() for can_id in df["CAN_ID"].unique()},
+            key=lambda can_id: int(can_id, 16),
+        )
         id_tokens = [str(int(i, 16) + self._id_offset) for i in uniq_ids]
         self._add_tokens(id_tokens)
 

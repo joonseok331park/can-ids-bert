@@ -40,7 +40,10 @@ def main() -> None:
 
     tok = CANTokenizer()  # 00~FF 데이터 토큰 및 특수 토큰 자동 포함
     tok._add_tokens(  # 내부 메서드 사용 허용 – 프로젝트 컨벤션
-        [str(int(cid, 16) + tok.id_offset) for cid in ids]
+        [
+            str(int(cid, 16) + tok.id_offset)
+            for cid in sorted(ids, key=lambda value: int(value, 16))
+        ]
     )
     tok.save_vocab(vocab_path)
     print(f"[INFO] vocab saved → {vocab_path}  (size={tok.vocab_size:,})")
