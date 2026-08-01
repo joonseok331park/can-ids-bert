@@ -64,12 +64,20 @@ class ClassificationIntegrityTests(unittest.TestCase):
     def test_loader_sorts_paths_and_retains_provenance(self):
         with tempfile.TemporaryDirectory() as tmp:
             data_dir = Path(tmp)
-            write_frames(data_dir / "DoS_z.log", 1)
-            write_frames(data_dir / "Benign_a.log", 1)
+            write_frames(data_dir / "Benign_z.log", 1, "456")
+            write_frames(data_dir / "Benign_a.log", 1, "123")
             frame = load_classification_data(data_dir)
-        self.assertEqual(frame["SourceFile"].tolist(), ["Benign_a.log", "DoS_z.log"])
+        self.assertEqual(
+            frame["SourceFile"].tolist(), ["Benign_a.log", "Benign_z.log"]
+        )
         self.assertEqual(frame["SourceLine"].tolist(), [1, 1])
-        self.assertEqual(frame["Label"].tolist(), [0, 1])
+        self.assertEqual(frame["Label"].tolist(), [0, 0])
+        self.assertEqual(frame["CAN_ID"].tolist(), ["123", "456"])
+
+    def test_loader_rejects_empty_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaisesRegex(ValueError, "No .log files"):
+                load_classification_data(Path(tmp))
 
     def test_unclassified_filename_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

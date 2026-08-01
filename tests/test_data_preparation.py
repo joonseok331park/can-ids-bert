@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.aggregate_data import aggregate_files
 from scripts.prepare_finetune_data import (
@@ -86,6 +87,14 @@ class DataPreparationTests(unittest.TestCase):
             self.assertTrue(
                 all(len(entry["source_sha256"]) == 64 for entry in manifest["entries"])
             )
+            self.assertEqual(manifest["schema_version"], 2)
+            self.assertEqual(
+                manifest["class_seeds"],
+                {"Benign": 7, "DoS": 8, "Fuzzy": 9, "Malfunction": 10},
+            )
+            self.assertEqual(
+                manifest["seed_derivation"], "base seed + CLASS_NAMES index"
+            )
 
             repeated = prepare_splits(
                 dataset,
@@ -106,12 +115,71 @@ class DataPreparationTests(unittest.TestCase):
             (output / "keep.txt").write_text("user file", encoding="utf-8")
             with self.assertRaises(FileExistsError):
                 prepare_splits(dataset, output, link_mode="copy")
-            with self.assertRaisesRegex(FileExistsError, "unrelated entries"):
+            with self.assertRaisesRegex(FileExistsError, "valid split_manifest"):
                 prepare_splits(
                     dataset, output, overwrite=True, link_mode="copy"
                 )
             self.assertEqual(
                 (output / "keep.txt").read_text(encoding="utf-8"), "user file"
+            )
+
+    def test_overwrite_rejects_nested_unknown_and_missing_manifest_files(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / "dataset"
+            output = root / "prepared"
+            build_dataset(dataset)
+            manifest = prepare_splits(dataset, output, link_mode="copy")
+
+            keep = output / "train" / "nested" / "keep.txt"
+            keep.parent.mkdir()
+            keep.write_text("user file", encoding="utf-8")
+            with self.assertRaisesRegex(FileExistsError, "not manifest-owned"):
+                prepare_splits(
+                    dataset, output, overwrite=True, link_mode="copy"
+                )
+            self.assertEqual(keep.read_text(encoding="utf-8"), "user file")
+
+            keep.unlink()
+            keep.parent.rmdir()
+            missing = output / manifest["entries"][0]["target_relative_path"]
+            missing.unlink()
+            with self.assertRaisesRegex(FileExistsError, "missing files"):
+                prepare_splits(
+                    dataset, output, overwrite=True, link_mode="copy"
+                )
+            self.assertFalse(missing.exists())
+
+    def test_generation_failure_preserves_existing_output_tree(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / "dataset"
+            output = root / "prepared"
+            build_dataset(dataset)
+            prepare_splits(dataset, output, link_mode="copy")
+            before = {
+                path.relative_to(output).as_posix(): path.read_bytes()
+                for path in output.rglob("*")
+                if path.is_file()
+            }
+
+            with patch(
+                "scripts.prepare_finetune_data._materialize",
+                side_effect=RuntimeError("simulated generation failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "simulated generation"):
+                    prepare_splits(
+                        dataset, output, overwrite=True, link_mode="copy"
+                    )
+
+            after = {
+                path.relative_to(output).as_posix(): path.read_bytes()
+                for path in output.rglob("*")
+                if path.is_file()
+            }
+            self.assertEqual(after, before)
+            self.assertEqual(
+                list(root.glob(".prepared.staging-*")), [], "staging tree leaked"
             )
 
     def test_small_class_and_unknown_attack_are_rejected_before_output(self):

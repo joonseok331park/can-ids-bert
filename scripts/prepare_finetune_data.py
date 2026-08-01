@@ -8,14 +8,16 @@ import json
 import os
 import random
 import shutil
-from pathlib import Path
-from typing import Dict, Iterable, List, Tuple
+from pathlib import Path, PurePosixPath
+from typing import Any, Dict, Iterable, List, Mapping, Tuple
+from uuid import uuid4
 
 from core.classes import CLASS_NAMES
 
 
 SPLIT_NAMES = ("train", "validation", "test")
 MANIFEST_NAME = "split_manifest.json"
+MANIFEST_SCHEMA_VERSION = 2
 
 
 def _sorted_logs(directory: Path) -> list[Path]:
@@ -126,9 +128,104 @@ def _sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _prepare_output_dir(output_dir: Path, overwrite: bool) -> None:
+def _manifest_target(entry: Mapping[str, Any]) -> PurePosixPath:
+    class_name = entry.get("class")
+    split_name = entry.get("split")
+    raw_target = entry.get("target_relative_path")
+    if class_name not in CLASS_NAMES or split_name not in SPLIT_NAMES:
+        raise ValueError("Split manifest contains an invalid class or split")
+    if not isinstance(raw_target, str):
+        raise ValueError("Split manifest target_relative_path must be a string")
+
+    target = PurePosixPath(raw_target)
+    if (
+        target.is_absolute()
+        or ".." in target.parts
+        or target.as_posix() != raw_target
+        or len(target.parts) != 2
+        or target.parts[0] != split_name
+        or target.suffix.casefold() != ".log"
+        or not target.name.casefold().startswith(f"{class_name}_".casefold())
+    ):
+        raise ValueError(f"Unsafe split manifest target: {raw_target!r}")
+    return target
+
+
+def _validate_manifest_owned_tree(output_dir: Path) -> None:
+    manifest_path = output_dir / MANIFEST_NAME
+    if not manifest_path.is_file():
+        raise FileExistsError(
+            f"Cannot overwrite {output_dir}: a valid {MANIFEST_NAME} is required"
+        )
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as error:
+        raise FileExistsError(
+            f"Cannot overwrite {output_dir}: invalid {MANIFEST_NAME}: {error}"
+        ) from error
+    if not isinstance(manifest, Mapping):
+        raise FileExistsError(
+            f"Cannot overwrite {output_dir}: manifest root must be an object"
+        )
+    if manifest.get("schema_version") not in {1, MANIFEST_SCHEMA_VERSION}:
+        raise FileExistsError(
+            f"Cannot overwrite {output_dir}: unsupported manifest schema"
+        )
+    entries = manifest.get("entries")
+    if not isinstance(entries, list) or not entries:
+        raise FileExistsError(
+            f"Cannot overwrite {output_dir}: manifest entries are missing"
+        )
+
+    expected_files = {MANIFEST_NAME}
+    expected_dirs: set[str] = set()
+    try:
+        for entry in entries:
+            if not isinstance(entry, Mapping):
+                raise ValueError("Split manifest entry must be an object")
+            target = _manifest_target(entry)
+            target_name = target.as_posix()
+            if target_name in expected_files:
+                raise ValueError(f"Duplicate split manifest target: {target_name}")
+            expected_files.add(target_name)
+            parent = target.parent
+            while parent != PurePosixPath("."):
+                expected_dirs.add(parent.as_posix())
+                parent = parent.parent
+    except ValueError as error:
+        raise FileExistsError(
+            f"Cannot overwrite {output_dir}: invalid {MANIFEST_NAME}: {error}"
+        ) from error
+
+    actual_files: set[str] = set()
+    actual_dirs: set[str] = set()
+    for path in output_dir.rglob("*"):
+        relative = path.relative_to(output_dir).as_posix()
+        if path.is_dir() and not path.is_symlink():
+            actual_dirs.add(relative)
+        else:
+            actual_files.add(relative)
+
+    unknown_files = sorted(actual_files - expected_files)
+    missing_files = sorted(expected_files - actual_files)
+    unknown_dirs = sorted(actual_dirs - expected_dirs)
+    if unknown_files or missing_files or unknown_dirs:
+        details = []
+        if unknown_files:
+            details.append("unknown files=" + ", ".join(unknown_files))
+        if missing_files:
+            details.append("missing files=" + ", ".join(missing_files))
+        if unknown_dirs:
+            details.append("unknown directories=" + ", ".join(unknown_dirs))
+        raise FileExistsError(
+            f"Cannot overwrite {output_dir}: existing tree is not manifest-owned ("
+            + "; ".join(details)
+            + ")"
+        )
+
+
+def _validate_output_dir(output_dir: Path, overwrite: bool) -> None:
     if not output_dir.exists():
-        output_dir.mkdir(parents=True)
         return
     if not output_dir.is_dir():
         raise NotADirectoryError(output_dir)
@@ -138,18 +235,32 @@ def _prepare_output_dir(output_dir: Path, overwrite: bool) -> None:
         raise FileExistsError(
             f"Output directory is not empty: {output_dir}; use --overwrite"
         )
-    allowed = set(SPLIT_NAMES) | {MANIFEST_NAME}
-    unexpected = sorted(path.name for path in existing if path.name not in allowed)
-    if unexpected:
-        raise FileExistsError(
-            "Refusing to overwrite a directory with unrelated entries: "
-            + ", ".join(unexpected)
+    if existing:
+        _validate_manifest_owned_tree(output_dir)
+
+
+def _sibling_work_dir(output_dir: Path, label: str) -> Path:
+    while True:
+        candidate = output_dir.with_name(
+            f".{output_dir.name}.{label}-{uuid4().hex}"
         )
-    for path in existing:
-        if path.is_dir():
-            shutil.rmtree(path)
-        else:
-            path.unlink()
+        if not candidate.exists():
+            return candidate
+
+
+def _replace_with_staging(output_dir: Path, staging_dir: Path) -> None:
+    if not output_dir.exists():
+        staging_dir.rename(output_dir)
+        return
+
+    backup_dir = _sibling_work_dir(output_dir, "backup")
+    output_dir.rename(backup_dir)
+    try:
+        staging_dir.rename(output_dir)
+    except Exception:
+        backup_dir.rename(output_dir)
+        raise
+    shutil.rmtree(backup_dir)
 
 
 def _materialize(source: Path, target: Path, link_mode: str) -> str:
@@ -187,13 +298,16 @@ def prepare_splits(
 
     classified = classify_source_files(dataset_dir)
     planned: dict[str, dict[str, list[Path]]] = {}
+    class_seeds: dict[str, int] = {}
     for class_index, class_name in enumerate(CLASS_NAMES):
         files = classified[class_name]
         if len(files) < 3:
             raise ValueError(
                 f"Class {class_name} requires at least 3 files; found {len(files)}"
             )
-        groups = split_files(files, train_ratio, val_ratio, seed + class_index)
+        effective_seed = seed + class_index
+        class_seeds[class_name] = effective_seed
+        groups = split_files(files, train_ratio, val_ratio, effective_seed)
         planned[class_name] = dict(zip(SPLIT_NAMES, groups))
 
     every_source: list[Path] = [
@@ -211,52 +325,65 @@ def prepare_splits(
                     f"Class {class_name} is absent from split {split_name}"
                 )
 
-    _prepare_output_dir(output_dir, overwrite)
-    entries = []
-    for class_name in CLASS_NAMES:
-        for split_name in SPLIT_NAMES:
-            for index, source in enumerate(planned[class_name][split_name], start=1):
-                target_name = f"{class_name}_{index:03d}_{source.stem}.log"
-                target = output_dir / split_name / target_name
-                materialization = _materialize(source, target, link_mode)
-                entries.append(
-                    {
-                        "class": class_name,
-                        "split": split_name,
-                        "source_relative_path": source.relative_to(
-                            dataset_dir
-                        ).as_posix(),
-                        "target_relative_path": target.relative_to(
-                            output_dir
-                        ).as_posix(),
-                        "materialization": materialization,
-                        "source_sha256": _sha256(source),
-                    }
-                )
+    _validate_output_dir(output_dir, overwrite)
+    output_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_dir = _sibling_work_dir(output_dir, "staging")
+    staging_dir.mkdir()
+    try:
+        entries = []
+        for class_name in CLASS_NAMES:
+            for split_name in SPLIT_NAMES:
+                for index, source in enumerate(
+                    planned[class_name][split_name], start=1
+                ):
+                    target_name = f"{class_name}_{index:03d}_{source.stem}.log"
+                    target = staging_dir / split_name / target_name
+                    materialization = _materialize(source, target, link_mode)
+                    entries.append(
+                        {
+                            "class": class_name,
+                            "split": split_name,
+                            "source_relative_path": source.relative_to(
+                                dataset_dir
+                            ).as_posix(),
+                            "target_relative_path": target.relative_to(
+                                staging_dir
+                            ).as_posix(),
+                            "materialization": materialization,
+                            "source_sha256": _sha256(source),
+                        }
+                    )
 
-    manifest = {
-        "schema_version": 1,
-        "seed": seed,
-        "ratios": {
-            "train": train_ratio,
-            "validation": val_ratio,
-            "test": 1.0 - train_ratio - val_ratio,
-        },
-        "classification_rules": {
-            "Benign": "files under Benign",
-            "DoS": "Real_attacks filename contains dos",
-            "Fuzzy": "Real_attacks filename contains fuzz",
-            "Malfunction": (
-                "Real_attacks filename contains malfunction, or file is under "
-                "Masquerade_attacks/Suspension_attacks"
-            ),
-        },
-        "entries": entries,
-    }
-    (output_dir / MANIFEST_NAME).write_text(
-        json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+        manifest = {
+            "schema_version": MANIFEST_SCHEMA_VERSION,
+            "seed": seed,
+            "seed_derivation": "base seed + CLASS_NAMES index",
+            "class_seeds": class_seeds,
+            "ratios": {
+                "train": train_ratio,
+                "validation": val_ratio,
+                "test": 1.0 - train_ratio - val_ratio,
+            },
+            "classification_rules": {
+                "Benign": "files under Benign",
+                "DoS": "Real_attacks filename contains dos",
+                "Fuzzy": "Real_attacks filename contains fuzz",
+                "Malfunction": (
+                    "Real_attacks filename contains malfunction, or file is under "
+                    "Masquerade_attacks/Suspension_attacks"
+                ),
+            },
+            "entries": entries,
+        }
+        (staging_dir / MANIFEST_NAME).write_text(
+            json.dumps(manifest, ensure_ascii=False, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        _replace_with_staging(output_dir, staging_dir)
+    except Exception:
+        if staging_dir.exists():
+            shutil.rmtree(staging_dir)
+        raise
     return manifest
 
 
