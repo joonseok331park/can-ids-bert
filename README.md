@@ -36,7 +36,7 @@ candump logs
 
 ## 환경과 최소 검증
 
-- Python 3.10 이상
+- Python 3.12 (CI와 현재 smoke test 기준)
 - 학습에는 PyTorch와 `requirements.txt`의 패키지 필요
 - 문서화한 분산 사전 학습 경로는 Linux, CUDA, NCCL 환경을 전제로 함
 
@@ -46,7 +46,7 @@ GPU 환경에 맞는 PyTorch를 [공식 설치 안내](https://pytorch.org/get-s
 python -m venv .venv
 # activate the environment for your shell
 python -m pip install --upgrade pip
-python -m pip install torch
+python -m pip install torch==2.13.0+cpu --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -r requirements.txt
 ```
 
