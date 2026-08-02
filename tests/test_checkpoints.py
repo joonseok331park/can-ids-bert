@@ -1,4 +1,5 @@
 import hashlib
+import json
 import tempfile
 import unittest
 import warnings
@@ -9,6 +10,7 @@ from unittest.mock import patch
 import torch
 from transformers import BertConfig
 
+from core.tokenizer import CANTokenizer
 from models.teacher import CANBertForMaskedLM
 from models.teacher_classifier import CANBertForClassification
 from scripts.finetune import (
@@ -125,11 +127,30 @@ class CheckpointTests(unittest.TestCase):
             self.assertTrue(torch.equal(value, classifier.bert.state_dict()[key]))
 
     def test_finetuning_rejects_same_size_vocabulary_with_different_hash(self):
-        checkpoint_vocab = b'{"token": "A"}\n'
-        current_vocab = b'{"token": "B"}\n'
+        checkpoint_mapping = json.loads(
+            json.dumps(CANTokenizer().token_to_id)
+        )
+        current_mapping = dict(checkpoint_mapping)
+        current_mapping["00"], current_mapping["01"] = (
+            current_mapping["01"],
+            current_mapping["00"],
+        )
+        checkpoint_vocab = (
+            json.dumps(checkpoint_mapping, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        current_vocab = (
+            json.dumps(current_mapping, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        ).encode("utf-8")
+        self.assertEqual(len(checkpoint_mapping), len(current_mapping))
+        self.assertEqual(set(checkpoint_mapping), set(current_mapping))
+        self.assertNotEqual(checkpoint_mapping, current_mapping)
         self.assertEqual(len(checkpoint_vocab), len(current_vocab))
+        config = tiny_config()
+        config.vocab_size = len(checkpoint_mapping)
         _, payload = self._pretraining_payload(
-            hashlib.sha256(checkpoint_vocab).hexdigest()
+            hashlib.sha256(checkpoint_vocab).hexdigest(), config
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -141,7 +162,7 @@ class CheckpointTests(unittest.TestCase):
                 IncompatiblePretrainedCheckpointError, "vocab_sha256"
             ):
                 _load_finetune_pretrained_checkpoint(
-                    CANBertForClassification(tiny_config()),
+                    CANBertForClassification(config),
                     checkpoint_path,
                     vocab_path,
                 )
@@ -301,6 +322,11 @@ class CheckpointTests(unittest.TestCase):
                 vocab_path = root / "vocab.json"
                 vocab_path.write_bytes(vocab_bytes)
                 torch.save(payload, checkpoint_path)
+                classifier = CANBertForClassification(tiny_config())
+                before = {
+                    key: value.detach().clone()
+                    for key, value in classifier.state_dict().items()
+                }
                 with warnings.catch_warnings(record=True) as caught:
                     warnings.simplefilter("always")
                     with patch(
@@ -311,13 +337,15 @@ class CheckpointTests(unittest.TestCase):
                             "--pretrained_checkpoint",
                         ):
                             _load_finetune_pretrained_checkpoint(
-                                CANBertForClassification(tiny_config()),
+                                classifier,
                                 checkpoint_path,
                                 vocab_path,
                                 legacy=True,
                             )
                         load_weights.assert_not_called()
                 self.assertEqual(caught, [])
+                for key, value in classifier.state_dict().items():
+                    self.assertTrue(torch.equal(value, before[key]), key)
 
     def test_explicit_legacy_finetuning_rejects_key_and_shape_mismatch(self):
         teacher = CANBertForMaskedLM(tiny_config())
