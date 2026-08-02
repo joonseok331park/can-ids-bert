@@ -148,7 +148,7 @@ python -m scripts.finetune \
 
 일반 `--pretrained_checkpoint` 경로는 `schema_version=2`, `checkpoint_type=can-bert-pretrain`인 사전 학습 체크포인트만 허용합니다. 체크포인트의 `training_config.vocab_sha256`가 올바른 소문자 SHA-256이고 현재 `--vocab_path` 파일 내용의 해시와 정확히 같아야 합니다. 또한 `hidden_act`, dropout, position embedding 설정을 포함해 BERT forward semantics에 영향을 주는 model config 필드가 모두 현재 분류 모델과 일치해야 합니다. Vocabulary 크기만 같은 다른 파일이나 metadata가 누락된 체크포인트는 가중치를 적용하기 전에 거부합니다.
 
-Schema가 없는 이전 체크포인트는 일반 옵션으로 자동 이관하지 않습니다. 이 artifact의 vocabulary와 model config lineage를 별도로 확인한 경우에만 상호 배타적인 `--legacy_pretrained_checkpoint`를 명시합니다. 이 경로는 metadata를 검증할 수 없다는 경고를 내고 optimizer 등의 상태를 사용하지 않으며, BERT body의 key와 tensor shape가 완전히 일치하는 가중치만 불러옵니다.
+Schema가 없는 이전 체크포인트는 일반 옵션으로 자동 이관하지 않습니다. 이 artifact의 vocabulary와 model config lineage를 별도로 확인한 경우에만 상호 배타적인 `--legacy_pretrained_checkpoint`를 명시합니다. 이 경로는 checkpoint metadata로 vocabulary semantic compatibility를 검증할 수 없고 weights-only initialization만 수행한다는 경고와 함께, 사용자가 현재 `--vocab_path`와 동일한 vocabulary lineage인지 별도로 확인해야 한다고 명시합니다. Optimizer 등의 상태는 사용하지 않으며 BERT body의 key와 tensor shape가 완전히 일치하는 가중치만 불러옵니다. `schema_version` key가 하나라도 있는 체크포인트는 v2, 미래 schema, 잘못된 type 여부와 관계없이 legacy 경로에서 거부되며, 반드시 `--pretrained_checkpoint` 검증을 통과해야 합니다.
 
 ```bash
 python -m scripts.finetune \

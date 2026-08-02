@@ -4,6 +4,7 @@ import unittest
 import warnings
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 from transformers import BertConfig
@@ -261,16 +262,62 @@ class CheckpointTests(unittest.TestCase):
                     legacy=True,
                 )
             self.assertTrue(
-                any(
-                    issubclass(item.category, RuntimeWarning)
-                    and "legacy" in str(item.message)
-                    for item in caught
-                )
+                any(issubclass(item.category, RuntimeWarning) for item in caught)
             )
+            warning_text = " ".join(str(item.message) for item in caught).casefold()
+            for concept in (
+                "cannot verify vocabulary semantic compatibility",
+                "weights-only initialization",
+                "separately confirm",
+                "same vocabulary lineage",
+            ):
+                self.assertIn(concept, warning_text)
 
         self.assertEqual(loaded, len(classifier.bert.state_dict()))
         for key, value in teacher.bert.state_dict().items():
             self.assertTrue(torch.equal(value, classifier.bert.state_dict()[key]))
+
+    def test_explicit_legacy_finetuning_rejects_any_schema_before_weight_load(self):
+        vocab_bytes = b"current vocabulary"
+        current_vocab_sha256 = hashlib.sha256(vocab_bytes).hexdigest()
+        mismatched_vocab_sha256 = "0" * 64
+        self.assertNotEqual(current_vocab_sha256, mismatched_vocab_sha256)
+        teacher, versioned_payload = self._pretraining_payload(
+            mismatched_vocab_sha256
+        )
+        versioned_payload["checkpoint_type"] = "wrong-checkpoint-type"
+        future_payload = {
+            "schema_version": CHECKPOINT_SCHEMA_VERSION + 1,
+            "model": teacher.state_dict(),
+        }
+
+        for label, payload in (
+            ("v2-wrong-type-and-vocab", versioned_payload),
+            ("future-schema", future_payload),
+        ):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                checkpoint_path = root / "metadata-bearing.pt"
+                vocab_path = root / "vocab.json"
+                vocab_path.write_bytes(vocab_bytes)
+                torch.save(payload, checkpoint_path)
+                with warnings.catch_warnings(record=True) as caught:
+                    warnings.simplefilter("always")
+                    with patch(
+                        "scripts.finetune._load_pretrained_bert"
+                    ) as load_weights:
+                        with self.assertRaisesRegex(
+                            IncompatiblePretrainedCheckpointError,
+                            "--pretrained_checkpoint",
+                        ):
+                            _load_finetune_pretrained_checkpoint(
+                                CANBertForClassification(tiny_config()),
+                                checkpoint_path,
+                                vocab_path,
+                                legacy=True,
+                            )
+                        load_weights.assert_not_called()
+                self.assertEqual(caught, [])
 
     def test_explicit_legacy_finetuning_rejects_key_and_shape_mismatch(self):
         teacher = CANBertForMaskedLM(tiny_config())

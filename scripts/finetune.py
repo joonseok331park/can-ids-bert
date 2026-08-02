@@ -262,14 +262,24 @@ def _load_finetune_pretrained_checkpoint(
         raise FileNotFoundError(source)
     checkpoint = torch.load(source, map_location="cpu")
     if legacy:
+        legacy_checkpoint = _require_mapping(
+            checkpoint, "Legacy checkpoint payload"
+        )
+        if "schema_version" in legacy_checkpoint:
+            raise IncompatiblePretrainedCheckpointError(
+                "A checkpoint containing schema_version cannot be loaded with "
+                "--legacy_pretrained_checkpoint; use --pretrained_checkpoint "
+                "so its vocabulary lineage and model semantics are validated"
+            )
         warnings.warn(
-            "Loading a legacy pretrained checkpoint without schema, vocabulary "
-            "lineage, or model-config verification; applying compatible BERT "
-            "weights only",
+            "Schema-less legacy checkpoint metadata cannot verify vocabulary "
+            "semantic compatibility; performing weights-only initialization of "
+            "the BERT body. You must separately confirm that the checkpoint has "
+            "the same vocabulary lineage as the current --vocab_path",
             RuntimeWarning,
             stacklevel=2,
         )
-        model_state = _legacy_model_state(checkpoint)
+        model_state = _legacy_model_state(legacy_checkpoint)
     else:
         model_state = _versioned_model_state(
             checkpoint, model, vocab_path
