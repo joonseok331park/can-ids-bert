@@ -1,6 +1,7 @@
 import hashlib
 import tempfile
 import unittest
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,7 +11,9 @@ from transformers import BertConfig
 from models.teacher import CANBertForMaskedLM
 from models.teacher_classifier import CANBertForClassification
 from scripts.finetune import (
+    IncompatiblePretrainedCheckpointError,
     _finetune_checkpoint_payload,
+    _load_finetune_pretrained_checkpoint,
     _load_pretrained_bert,
 )
 from scripts.pretrain import _unwrap_model
@@ -84,6 +87,228 @@ class CheckpointTests(unittest.TestCase):
         classifier = CANBertForClassification(tiny_config())
         with self.assertRaises(RuntimeError):
             _load_pretrained_bert(classifier, {"cls.bias": torch.zeros(32)})
+
+    def _pretraining_payload(self, vocab_sha256, config=None):
+        config = config or tiny_config()
+        teacher = CANBertForMaskedLM(config)
+        model_config = config.to_dict()
+        model_config.setdefault(
+            "position_embedding_type",
+            getattr(config, "position_embedding_type", "absolute"),
+        )
+        return teacher, {
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "checkpoint_type": "can-bert-pretrain",
+            "model_state_dict": teacher.state_dict(),
+            "model_config": model_config,
+            "training_config": {"vocab_sha256": vocab_sha256},
+        }
+
+    def test_matching_versioned_pretraining_checkpoint_loads_for_finetuning(self):
+        vocab_bytes = b'{"tokens": ["A", "B"]}\n'
+        vocab_sha256 = hashlib.sha256(vocab_bytes).hexdigest()
+        teacher, payload = self._pretraining_payload(vocab_sha256)
+        classifier = CANBertForClassification(tiny_config())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vocab_path = root / "vocab.json"
+            checkpoint_path = root / "pretrained.pt"
+            vocab_path.write_bytes(vocab_bytes)
+            torch.save(payload, checkpoint_path)
+            loaded = _load_finetune_pretrained_checkpoint(
+                classifier, checkpoint_path, vocab_path
+            )
+
+        self.assertEqual(loaded, len(classifier.bert.state_dict()))
+        for key, value in teacher.bert.state_dict().items():
+            self.assertTrue(torch.equal(value, classifier.bert.state_dict()[key]))
+
+    def test_finetuning_rejects_same_size_vocabulary_with_different_hash(self):
+        checkpoint_vocab = b'{"token": "A"}\n'
+        current_vocab = b'{"token": "B"}\n'
+        self.assertEqual(len(checkpoint_vocab), len(current_vocab))
+        _, payload = self._pretraining_payload(
+            hashlib.sha256(checkpoint_vocab).hexdigest()
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            vocab_path = root / "vocab.json"
+            checkpoint_path = root / "pretrained.pt"
+            vocab_path.write_bytes(current_vocab)
+            torch.save(payload, checkpoint_path)
+            with self.assertRaisesRegex(
+                IncompatiblePretrainedCheckpointError, "vocab_sha256"
+            ):
+                _load_finetune_pretrained_checkpoint(
+                    CANBertForClassification(tiny_config()),
+                    checkpoint_path,
+                    vocab_path,
+                )
+
+    def test_finetuning_rejects_forward_semantic_model_config_mismatch(self):
+        vocab_bytes = b"vocabulary"
+        vocab_sha256 = hashlib.sha256(vocab_bytes).hexdigest()
+        for field, incompatible_value in (
+            ("hidden_act", "relu"),
+            ("attention_probs_dropout_prob", 0.25),
+        ):
+            with self.subTest(field=field):
+                _, payload = self._pretraining_payload(vocab_sha256)
+                payload["model_config"][field] = incompatible_value
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    vocab_path = root / "vocab.json"
+                    checkpoint_path = root / "pretrained.pt"
+                    vocab_path.write_bytes(vocab_bytes)
+                    torch.save(payload, checkpoint_path)
+                    with self.assertRaisesRegex(
+                        IncompatiblePretrainedCheckpointError, field
+                    ):
+                        _load_finetune_pretrained_checkpoint(
+                            CANBertForClassification(tiny_config()),
+                            checkpoint_path,
+                            vocab_path,
+                        )
+
+    def test_finetuning_rejects_wrong_checkpoint_type_and_schema(self):
+        vocab_bytes = b"vocabulary"
+        vocab_sha256 = hashlib.sha256(vocab_bytes).hexdigest()
+        for field, value, message in (
+            ("checkpoint_type", "can-bert-finetune", "checkpoint type"),
+            (
+                "schema_version",
+                CHECKPOINT_SCHEMA_VERSION + 1,
+                "Unsupported pretrained checkpoint schema",
+            ),
+        ):
+            with self.subTest(field=field):
+                _, payload = self._pretraining_payload(vocab_sha256)
+                payload[field] = value
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    vocab_path = root / "vocab.json"
+                    checkpoint_path = root / "pretrained.pt"
+                    vocab_path.write_bytes(vocab_bytes)
+                    torch.save(payload, checkpoint_path)
+                    with self.assertRaisesRegex(
+                        IncompatiblePretrainedCheckpointError, message
+                    ):
+                        _load_finetune_pretrained_checkpoint(
+                            CANBertForClassification(tiny_config()),
+                            checkpoint_path,
+                            vocab_path,
+                        )
+
+    def test_finetuning_rejects_missing_or_malformed_vocabulary_hash(self):
+        vocab_bytes = b"vocabulary"
+        valid_hash = hashlib.sha256(vocab_bytes).hexdigest()
+        for label, training_config in (
+            ("missing", {}),
+            ("malformed", {"vocab_sha256": "A" * 64}),
+        ):
+            with self.subTest(label=label):
+                _, payload = self._pretraining_payload(valid_hash)
+                payload["training_config"] = training_config
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    vocab_path = root / "vocab.json"
+                    checkpoint_path = root / "pretrained.pt"
+                    vocab_path.write_bytes(vocab_bytes)
+                    torch.save(payload, checkpoint_path)
+                    with self.assertRaisesRegex(
+                        IncompatiblePretrainedCheckpointError,
+                        "missing or invalid vocab_sha256",
+                    ):
+                        _load_finetune_pretrained_checkpoint(
+                            CANBertForClassification(tiny_config()),
+                            checkpoint_path,
+                            vocab_path,
+                        )
+
+    def test_schema_less_checkpoint_is_rejected_by_normal_finetuning_option(self):
+        teacher = CANBertForMaskedLM(tiny_config())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint_path = root / "legacy.pt"
+            vocab_path = root / "vocab.json"
+            vocab_path.write_text("{}\n", encoding="utf-8")
+            torch.save({"model": teacher.state_dict()}, checkpoint_path)
+            with self.assertRaisesRegex(
+                IncompatiblePretrainedCheckpointError,
+                "--legacy_pretrained_checkpoint",
+            ):
+                _load_finetune_pretrained_checkpoint(
+                    CANBertForClassification(tiny_config()),
+                    checkpoint_path,
+                    vocab_path,
+                )
+
+    def test_explicit_legacy_finetuning_checkpoint_loads_with_warning(self):
+        teacher = CANBertForMaskedLM(tiny_config())
+        classifier = CANBertForClassification(tiny_config())
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            checkpoint_path = root / "legacy.pt"
+            vocab_path = root / "vocab.json"
+            vocab_path.write_text("{}\n", encoding="utf-8")
+            torch.save({"model": teacher.state_dict()}, checkpoint_path)
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                loaded = _load_finetune_pretrained_checkpoint(
+                    classifier,
+                    checkpoint_path,
+                    vocab_path,
+                    legacy=True,
+                )
+            self.assertTrue(
+                any(
+                    issubclass(item.category, RuntimeWarning)
+                    and "legacy" in str(item.message)
+                    for item in caught
+                )
+            )
+
+        self.assertEqual(loaded, len(classifier.bert.state_dict()))
+        for key, value in teacher.bert.state_dict().items():
+            self.assertTrue(torch.equal(value, classifier.bert.state_dict()[key]))
+
+    def test_explicit_legacy_finetuning_rejects_key_and_shape_mismatch(self):
+        teacher = CANBertForMaskedLM(tiny_config())
+        state = teacher.state_dict()
+        body_key = next(key for key in state if key.startswith("bert."))
+        incompatible_states = {}
+        missing_key_state = dict(state)
+        missing_key_state.pop(body_key)
+        incompatible_states["missing keys"] = missing_key_state
+        shape_mismatch_state = dict(state)
+        shape_mismatch_state[body_key] = state[body_key].reshape(-1)[:1]
+        incompatible_states["shape mismatches"] = shape_mismatch_state
+
+        for message, incompatible_state in incompatible_states.items():
+            with self.subTest(message=message):
+                with tempfile.TemporaryDirectory() as tmp:
+                    root = Path(tmp)
+                    checkpoint_path = root / "legacy.pt"
+                    vocab_path = root / "vocab.json"
+                    vocab_path.write_text("{}\n", encoding="utf-8")
+                    torch.save({"model": incompatible_state}, checkpoint_path)
+                    with warnings.catch_warnings(record=True) as caught:
+                        warnings.simplefilter("always")
+                        with self.assertRaisesRegex(
+                            IncompatiblePretrainedCheckpointError, message
+                        ):
+                            _load_finetune_pretrained_checkpoint(
+                                CANBertForClassification(tiny_config()),
+                                checkpoint_path,
+                                vocab_path,
+                                legacy=True,
+                            )
+                    self.assertTrue(
+                        any(
+                            issubclass(item.category, RuntimeWarning)
+                            for item in caught
+                        )
+                    )
 
     def test_finetune_checkpoint_uses_plain_config_data(self):
         config = tiny_config()

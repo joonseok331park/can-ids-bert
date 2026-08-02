@@ -5,9 +5,12 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import os
+import warnings
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Any, Dict, List, Tuple
 import numpy as np
 
 import torch
@@ -26,6 +29,41 @@ from core.classification_dataset import ClassificationDataset
 from core.classes import CLASS_LABELS, CLASS_NAMES, NUM_CLASSES
 from core.tokenizer import CANTokenizer
 from models.teacher_classifier import CANBertForClassification
+from scripts.pretrain import (
+    CHECKPOINT_SCHEMA_VERSION as PRETRAIN_CHECKPOINT_SCHEMA_VERSION,
+    CHECKPOINT_TYPE as PRETRAIN_CHECKPOINT_TYPE,
+    MODEL_CONFIG_REQUIRED_KEYS as PRETRAIN_MODEL_CONFIG_REQUIRED_KEYS,
+)
+
+
+class IncompatiblePretrainedCheckpointError(RuntimeError):
+    """Raised when fine-tuning cannot safely consume pretrained weights."""
+
+
+def _sha256_file(path: str | Path) -> str:
+    source = Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    digest = hashlib.sha256()
+    with source.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _valid_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.casefold()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _require_mapping(value: Any, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise IncompatiblePretrainedCheckpointError(f"{label} must be a mapping")
+    return value
 
 
 def _normalize_model_key(key: str) -> str:
@@ -38,32 +76,205 @@ def _normalize_model_key(key: str) -> str:
 
 def _load_pretrained_bert(
     model: CANBertForClassification,
-    model_state: Dict[str, torch.Tensor],
+    model_state: Mapping[str, Any],
 ) -> int:
     """Load a complete, shape-compatible BERT body or fail explicitly."""
-    candidates = {}
+    normalized_state: dict[str, Any] = {}
     for key, value in model_state.items():
+        if not isinstance(key, str):
+            raise IncompatiblePretrainedCheckpointError(
+                "Pretrained checkpoint contains a non-string model key"
+            )
         normalized = _normalize_model_key(key)
-        if normalized.startswith("bert."):
-            candidates[normalized.removeprefix("bert.")] = value
+        if normalized in normalized_state:
+            raise IncompatiblePretrainedCheckpointError(
+                f"Pretrained checkpoint contains duplicate model key {normalized!r}"
+            )
+        normalized_state[normalized] = value
+
+    has_wrapped_bert_body = any(
+        key.startswith("bert.") for key in normalized_state
+    )
+    candidates = (
+        {
+            key.removeprefix("bert."): value
+            for key, value in normalized_state.items()
+            if key.startswith("bert.")
+        }
+        if has_wrapped_bert_body
+        else normalized_state
+    )
 
     expected = model.bert.state_dict()
-    compatible = {
-        key: value
-        for key, value in candidates.items()
-        if key in expected and value.shape == expected[key].shape
-    }
-    missing = sorted(set(expected) - set(compatible))
-    if missing:
-        raise RuntimeError(
-            "Pretrained checkpoint does not contain a complete compatible BERT body "
-            f"({len(missing)} tensors missing or shape-mismatched)."
+    missing = sorted(set(expected) - set(candidates))
+    unexpected = sorted(set(candidates) - set(expected))
+    malformed = sorted(
+        key for key, value in candidates.items() if not torch.is_tensor(value)
+    )
+    shape_mismatches = sorted(
+        key
+        for key in set(expected) & set(candidates)
+        if torch.is_tensor(candidates[key])
+        and candidates[key].shape != expected[key].shape
+    )
+    if missing or unexpected or malformed or shape_mismatches:
+        details = []
+        if missing:
+            details.append("missing keys=" + ", ".join(missing))
+        if unexpected:
+            details.append("unexpected keys=" + ", ".join(unexpected))
+        if malformed:
+            details.append("non-tensor values=" + ", ".join(malformed))
+        if shape_mismatches:
+            details.append("shape mismatches=" + ", ".join(shape_mismatches))
+        raise IncompatiblePretrainedCheckpointError(
+            "Pretrained checkpoint does not contain an exact compatible BERT body: "
+            + "; ".join(details)
         )
 
-    result = model.bert.load_state_dict(compatible, strict=True)
+    try:
+        result = model.bert.load_state_dict(candidates, strict=True)
+    except RuntimeError as error:
+        raise IncompatiblePretrainedCheckpointError(
+            f"Pretrained BERT state failed strict validation: {error}"
+        ) from error
     if result.missing_keys or result.unexpected_keys:
-        raise RuntimeError("Pretrained BERT state failed strict validation.")
-    return len(compatible)
+        raise IncompatiblePretrainedCheckpointError(
+            "Pretrained BERT state failed strict validation"
+        )
+    return len(candidates)
+
+
+def _legacy_model_state(checkpoint: Any) -> Mapping[str, Any]:
+    checkpoint = _require_mapping(checkpoint, "Legacy checkpoint payload")
+    for key in ("model_state_dict", "model", "state_dict"):
+        candidate = checkpoint.get(key)
+        if isinstance(candidate, Mapping):
+            return candidate
+    if checkpoint and all(torch.is_tensor(value) for value in checkpoint.values()):
+        return checkpoint
+    raise IncompatiblePretrainedCheckpointError(
+        "Legacy checkpoint does not contain model weights"
+    )
+
+
+def _versioned_model_state(
+    checkpoint: Any,
+    model: CANBertForClassification,
+    vocab_path: str | Path,
+) -> Mapping[str, Any]:
+    """Validate the versioned pretraining contract before returning weights."""
+    checkpoint = _require_mapping(checkpoint, "Pretrained checkpoint payload")
+    if "schema_version" not in checkpoint:
+        raise IncompatiblePretrainedCheckpointError(
+            "Schema-less checkpoints are rejected by --pretrained_checkpoint; "
+            "use --legacy_pretrained_checkpoint for an explicit weights-only load"
+        )
+    if checkpoint["schema_version"] != PRETRAIN_CHECKPOINT_SCHEMA_VERSION:
+        raise IncompatiblePretrainedCheckpointError(
+            f"Unsupported pretrained checkpoint schema "
+            f"{checkpoint['schema_version']!r}; expected "
+            f"{PRETRAIN_CHECKPOINT_SCHEMA_VERSION}"
+        )
+    if checkpoint.get("checkpoint_type") != PRETRAIN_CHECKPOINT_TYPE:
+        raise IncompatiblePretrainedCheckpointError(
+            "Unexpected pretrained checkpoint type: "
+            f"{checkpoint.get('checkpoint_type')!r}"
+        )
+
+    training_config = _require_mapping(
+        checkpoint.get("training_config"),
+        "Pretrained checkpoint training configuration",
+    )
+    stored_vocab_sha256 = training_config.get("vocab_sha256")
+    if not _valid_sha256(stored_vocab_sha256):
+        raise IncompatiblePretrainedCheckpointError(
+            "Pretrained checkpoint training configuration has missing or invalid "
+            "vocab_sha256"
+        )
+    current_vocab_sha256 = _sha256_file(vocab_path)
+    if stored_vocab_sha256 != current_vocab_sha256:
+        raise IncompatiblePretrainedCheckpointError(
+            "Vocabulary content is incompatible with the pretrained checkpoint: "
+            f"checkpoint vocab_sha256={stored_vocab_sha256}, "
+            f"current vocab_sha256={current_vocab_sha256}"
+        )
+
+    stored_model_config = _require_mapping(
+        checkpoint.get("model_config"),
+        "Pretrained checkpoint model configuration",
+    )
+    current_model_config = model.config.to_dict()
+    current_model_config.setdefault(
+        "position_embedding_type",
+        getattr(model.config, "position_embedding_type", "absolute"),
+    )
+    stored_missing = [
+        key
+        for key in PRETRAIN_MODEL_CONFIG_REQUIRED_KEYS
+        if key not in stored_model_config
+    ]
+    current_missing = [
+        key
+        for key in PRETRAIN_MODEL_CONFIG_REQUIRED_KEYS
+        if key not in current_model_config
+    ]
+    if stored_missing or current_missing:
+        details = []
+        if stored_missing:
+            details.append("checkpoint missing " + ", ".join(stored_missing))
+        if current_missing:
+            details.append("current model missing " + ", ".join(current_missing))
+        raise IncompatiblePretrainedCheckpointError(
+            "Pretrained model architecture is incomplete: " + "; ".join(details)
+        )
+    mismatches = [
+        key
+        for key in PRETRAIN_MODEL_CONFIG_REQUIRED_KEYS
+        if stored_model_config[key] != current_model_config[key]
+    ]
+    if mismatches:
+        details = ", ".join(
+            f"{key}: checkpoint={stored_model_config[key]!r}, "
+            f"current={current_model_config[key]!r}"
+            for key in mismatches
+        )
+        raise IncompatiblePretrainedCheckpointError(
+            "Pretrained model architecture is incompatible: " + details
+        )
+
+    return _require_mapping(
+        checkpoint.get("model_state_dict"),
+        "Pretrained checkpoint model_state_dict",
+    )
+
+
+def _load_finetune_pretrained_checkpoint(
+    model: CANBertForClassification,
+    checkpoint_path: str | Path,
+    vocab_path: str | Path,
+    *,
+    legacy: bool = False,
+) -> int:
+    """Load a validated schema-v2 checkpoint or an explicit legacy warm start."""
+    source = Path(checkpoint_path)
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    checkpoint = torch.load(source, map_location="cpu")
+    if legacy:
+        warnings.warn(
+            "Loading a legacy pretrained checkpoint without schema, vocabulary "
+            "lineage, or model-config verification; applying compatible BERT "
+            "weights only",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+        model_state = _legacy_model_state(checkpoint)
+    else:
+        model_state = _versioned_model_state(
+            checkpoint, model, vocab_path
+        )
+    return _load_pretrained_bert(model, model_state)
 
 
 def _finetune_checkpoint_payload(
@@ -223,10 +434,20 @@ def main() -> None:
     parser.add_argument("--val_data_dir", required=True, help="Validation data directory") 
     parser.add_argument("--test_data_dir", required=True, help="Test data directory")
     parser.add_argument("--vocab_path", required=True, help="Vocabulary file path")
-    parser.add_argument(
+    checkpoint_group = parser.add_mutually_exclusive_group(required=True)
+    checkpoint_group.add_argument(
         "--pretrained_checkpoint",
-        required=True,
-        help="Teacher checkpoint used to initialize the BERT body",
+        help=(
+            "Schema-v2 CAN-BERT pretraining checkpoint whose vocabulary and "
+            "forward model configuration match this run"
+        ),
+    )
+    checkpoint_group.add_argument(
+        "--legacy_pretrained_checkpoint",
+        help=(
+            "Explicitly load a schema-less legacy checkpoint as strictly "
+            "compatible BERT weights only"
+        ),
     )
     
     parser.add_argument("--output_dir", default="checkpoints", help="Output directory")
@@ -305,14 +526,17 @@ def main() -> None:
     )
     model = CANBertForClassification(config, num_labels=NUM_CLASSES).to(device)
     
-    print(f"[INFO] Loading pretrained weights from {args.pretrained_checkpoint}")
-    checkpoint = torch.load(args.pretrained_checkpoint, map_location=device)
-    
-    model_state = checkpoint.get(
-        "model_state_dict", checkpoint.get("model", checkpoint)
+    checkpoint_path = (
+        args.pretrained_checkpoint or args.legacy_pretrained_checkpoint
     )
-
-    loaded_tensors = _load_pretrained_bert(model, model_state)
+    legacy_checkpoint = args.legacy_pretrained_checkpoint is not None
+    print(f"[INFO] Loading pretrained weights from {checkpoint_path}")
+    loaded_tensors = _load_finetune_pretrained_checkpoint(
+        model,
+        checkpoint_path,
+        args.vocab_path,
+        legacy=legacy_checkpoint,
+    )
     print(f"[INFO] Loaded {loaded_tensors} pretrained BERT tensors")
     
     criterion = nn.CrossEntropyLoss(weight=class_weights)
