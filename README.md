@@ -70,7 +70,7 @@ python -m scripts.build_vocab \
 python -m scripts.split_data
 ```
 
-`aggregate_manifest.json`에는 정렬된 source relative path, source SHA-256, output SHA-256가 기록됩니다.
+`aggregate_manifest.json`에는 정렬된 source relative path, source SHA-256, output SHA-256가 기록됩니다. 병합 출력은 경로를 정규화한 뒤 source tree와 같은 위치이거나 그 내부이면 거부합니다. `..` 또는 symlink를 거친 경로도 실제 위치를 기준으로 검사하며, 이 검사는 출력 디렉터리를 만들거나 기존 파일을 교체하기 전에 수행됩니다.
 
 미세 조정 split은 source file 단위로 수행합니다. 각 클래스에 최소 세 파일이 있어야 하며, train/validation/test에 각 클래스가 하나 이상 포함되고 한 source가 두 split에 중복되지 않는지 확인합니다.
 
@@ -83,6 +83,8 @@ python -m scripts.prepare_finetune_data \
 ```
 
 `split_manifest.json`에는 class, split, source relative path, target relative path, materialization 방식, source SHA-256, ratio와 클래스별 유효 seed가 기록됩니다. 유효 seed는 기본 seed에 고정된 `CLASS_NAMES` index를 더해 계산합니다. `Real_attacks` 파일명은 `dos`, `fuzz`, `malfunction` 중 정확히 한 규칙에 일치해야 합니다. `Masquerade_attacks`와 `Suspension_attacks` 디렉터리는 Malfunction으로 분류합니다. 그 밖의 파일은 자동으로 Malfunction에 넣지 않고 오류로 보고합니다.
+
+`--dataset-dir`와 `--output-dir`는 서로 분리된 sibling tree여야 합니다. 두 경로가 같거나 어느 한쪽이 다른 쪽의 부모이면 원본 스캔이나 출력 변경 전에 중단합니다.
 
 정렬·최소 개수·고정 seed 규칙을 적용한 split은 이전 스크립트의 결과와 달라질 수 있으므로 기존 실험과 별도 lineage로 취급합니다.
 
@@ -144,6 +146,20 @@ python -m scripts.finetune \
   --short_file_policy skip
 ```
 
+일반 `--pretrained_checkpoint` 경로는 `schema_version=2`, `checkpoint_type=can-bert-pretrain`인 사전 학습 체크포인트만 허용합니다. 체크포인트의 `training_config.vocab_sha256`가 올바른 소문자 SHA-256이고 현재 `--vocab_path` 파일 내용의 해시와 정확히 같아야 합니다. 또한 `hidden_act`, dropout, position embedding 설정을 포함해 BERT forward semantics에 영향을 주는 model config 필드가 모두 현재 분류 모델과 일치해야 합니다. Vocabulary 크기만 같은 다른 파일이나 metadata가 누락된 체크포인트는 가중치를 적용하기 전에 거부합니다.
+
+Schema가 없는 이전 체크포인트는 일반 옵션으로 자동 이관하지 않습니다. 이 artifact의 vocabulary와 model config lineage를 별도로 확인한 경우에만 상호 배타적인 `--legacy_pretrained_checkpoint`를 명시합니다. 이 경로는 metadata를 검증할 수 없다는 경고를 내고 optimizer 등의 상태를 사용하지 않으며, BERT body의 key와 tensor shape가 완전히 일치하는 가중치만 불러옵니다.
+
+```bash
+python -m scripts.finetune \
+  --train_data_dir data/finetune_data/train \
+  --val_data_dir data/finetune_data/validation \
+  --test_data_dir data/finetune_data/test \
+  --vocab_path checkpoints/vocab.json \
+  --legacy_pretrained_checkpoint checkpoints/legacy-model-only.pt \
+  --output_dir checkpoints
+```
+
 ## 검증
 
 Smoke test는 parser/tokenizer/dataset의 기본 동작과 teacher/classifier CPU forward shape를 확인합니다.
@@ -152,7 +168,7 @@ Smoke test는 parser/tokenizer/dataset의 기본 동작과 teacher/classifier CP
 python -m unittest tests.test_data_pipeline tests.test_models -v
 ```
 
-Training/data integrity test는 accumulation 잔여 update, scheduler/global-step 수, AMP overflow, DDP `no_sync`, checkpoint round trip·한 update 연속성·입력 hash 불일치 거부, file boundary, missing class, empty loader, deterministic manifest·안전한 overwrite 정책을 합성 입력으로 확인합니다.
+Training/data integrity test는 accumulation 잔여 update, scheduler/global-step 수, AMP overflow, DDP `no_sync`, checkpoint round trip·한 update 연속성·입력 hash 불일치 거부, fine-tune checkpoint lineage와 legacy strict load, file boundary, missing class, empty loader, deterministic manifest·안전한 overwrite 및 source/output 경로 분리 정책을 합성 입력으로 확인합니다.
 
 ```bash
 python -m unittest \
