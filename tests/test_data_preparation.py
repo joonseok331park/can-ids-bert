@@ -59,6 +59,34 @@ class DataPreparationTests(unittest.TestCase):
             )
             self.assertEqual(on_disk, second)
 
+    def test_aggregate_rejects_resolved_output_inside_source_before_mutation(self):
+        for label in ("equal", "nested", "normalized"):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                source = root / "source"
+                write_log(source / "input.log", 1)
+                before = (source / "input.log").read_bytes()
+                if label == "equal":
+                    output = source
+                elif label == "nested":
+                    output = source / "generated" / "aggregate.log"
+                    output.parent.mkdir()
+                    output.write_text("must survive\n", encoding="utf-8")
+                else:
+                    (source / "generated").mkdir()
+                    output = source / "generated" / ".." / "aggregate.log"
+
+                with self.assertRaisesRegex(ValueError, "outside the source tree"):
+                    aggregate_files(source, output, overwrite=True)
+
+                self.assertEqual((source / "input.log").read_bytes(), before)
+                if label == "nested":
+                    self.assertEqual(
+                        output.read_text(encoding="utf-8"), "must survive\n"
+                    )
+                elif label == "normalized":
+                    self.assertFalse(output.resolve().exists())
+
     def test_three_files_per_class_produces_one_file_in_every_split(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -104,6 +132,52 @@ class DataPreparationTests(unittest.TestCase):
                 link_mode="copy",
             )
             self.assertEqual(repeated, manifest)
+
+    def test_prepare_splits_rejects_overlap_in_both_directions_before_mutation(self):
+        for label in ("equal", "output-child", "source-child"):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                if label == "source-child":
+                    output = root / "container"
+                    dataset = output / "dataset"
+                else:
+                    dataset = root / "dataset"
+                    output = (
+                        dataset
+                        if label == "equal"
+                        else dataset / "generated" / ".." / "prepared"
+                    )
+                build_dataset(dataset)
+                before = {
+                    path.relative_to(dataset).as_posix(): path.read_bytes()
+                    for path in dataset.rglob("*")
+                    if path.is_file()
+                }
+
+                with self.assertRaisesRegex(ValueError, "must be disjoint"):
+                    prepare_splits(
+                        dataset,
+                        output,
+                        overwrite=True,
+                        link_mode="copy",
+                    )
+
+                after = {
+                    path.relative_to(dataset).as_posix(): path.read_bytes()
+                    for path in dataset.rglob("*")
+                    if path.is_file()
+                }
+                self.assertEqual(after, before)
+                self.assertFalse((output / "split_manifest.json").exists())
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / "dataset"
+            output = root / "prepared"
+            build_dataset(dataset)
+            manifest = prepare_splits(dataset, output, link_mode="copy")
+            self.assertEqual(len(manifest["entries"]), 12)
+            self.assertTrue((output / "split_manifest.json").is_file())
 
     def test_nonempty_output_requires_overwrite_and_preserves_unknown_entries(self):
         with tempfile.TemporaryDirectory() as tmp:

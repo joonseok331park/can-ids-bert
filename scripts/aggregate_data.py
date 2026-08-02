@@ -47,6 +47,10 @@ def aggregate_files(
     """Aggregate sorted source files and return a relative-path manifest."""
     source_dir = source_dir.resolve()
     output_file = output_file.resolve()
+    if output_file == source_dir or source_dir in output_file.parents:
+        raise ValueError(
+            "Aggregate output must be entirely outside the source tree"
+        )
     if not source_dir.is_dir():
         raise FileNotFoundError(source_dir)
     files = sorted(
@@ -55,9 +59,6 @@ def aggregate_files(
     )
     if not files:
         raise ValueError(f"No .log files found in {source_dir}")
-    if output_file in files:
-        raise ValueError("Output file must not be inside the source file set")
-
     _prepare_output(output_file, overwrite)
     entries = []
     with output_file.open("wb") as output:

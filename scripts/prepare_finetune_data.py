@@ -293,8 +293,15 @@ def prepare_splits(
         raise ValueError("link_mode must be auto, copy, or symlink")
     dataset_dir = dataset_dir.resolve()
     output_dir = output_dir.resolve()
-    if output_dir == dataset_dir or dataset_dir in output_dir.parents:
-        raise ValueError("Output directory must not be inside the source dataset")
+    if (
+        output_dir == dataset_dir
+        or dataset_dir in output_dir.parents
+        or output_dir in dataset_dir.parents
+    ):
+        raise ValueError(
+            "Source dataset and output directory must be disjoint; neither may "
+            "contain the other"
+        )
 
     classified = classify_source_files(dataset_dir)
     planned: dict[str, dict[str, list[Path]]] = {}
