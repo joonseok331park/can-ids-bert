@@ -1,45 +1,93 @@
-# CAN-BERT 사전 학습 실험 스크립트
-# -*- coding: utf-8 -*-
-"""
-CAN‑BERT 사전 훈련 스크립트 (기본 DDP 지원)
-
-▪ 8-GPU DDP 분산 훈련 지원
-▪ DistributedSampler 사용 (Map-style Dataset)
-▪ find_unused_parameters=True로 BertModel pooler 미사용 문제 해결
-▪ 점진적 체크포인트 재개 지원
-"""
+"""Pre-train the public CAN-BERT teacher prototype."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
+import math
 import os
 import random
-import sys
+from contextlib import nullcontext
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Tuple
+from typing import Any, Mapping, Tuple
 
 import numpy as np
 import torch
 import torch.distributed as dist
 import wandb
-from torch.cuda.amp import GradScaler, autocast
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, DistributedSampler
 from tqdm.auto import tqdm
 from transformers import BertConfig, get_linear_schedule_with_warmup
 
 from core.dataset import MLMDataset
-from core.tokenizer import CANTokenizer, CANSequencer
+from core.tokenizer import CANSequencer, CANTokenizer
 from models.teacher import CANBertForMaskedLM
 from utils.data_loader import load_can_data
 
 
-# --------------------------------------------------------------------------- #
-# 1. DDP 및 준비 유틸리티                                                      #
-# --------------------------------------------------------------------------- #
+CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_TYPE = "can-bert-pretrain"
+TRAINING_CONFIG_REQUIRED_KEYS = (
+    "microbatches_per_epoch",
+    "gradient_accumulation_steps",
+    "updates_per_epoch",
+    "total_epochs",
+    "total_optimizer_steps",
+    "warmup_steps",
+    "learning_rate",
+    "mask_prob",
+    "batch_size",
+    "seed",
+    "world_size",
+    "amp_enabled",
+    "seq_len",
+    "dataset_type",
+    "vocab_sha256",
+    "dataset_sha256",
+)
+MODEL_CONFIG_REQUIRED_KEYS = (
+    "vocab_size",
+    "hidden_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "intermediate_size",
+    "hidden_act",
+    "hidden_dropout_prob",
+    "attention_probs_dropout_prob",
+    "max_position_embeddings",
+    "type_vocab_size",
+    "initializer_range",
+    "layer_norm_eps",
+    "pad_token_id",
+    "position_embedding_type",
+    "use_cache",
+    "tie_word_embeddings",
+)
 
-def _seed_everything(seed: int = 42):
-    """모든 랜덤 시드 고정 (재현성)"""
+
+@dataclass(frozen=True)
+class TrainEpochResult:
+    average_raw_loss: float
+    microbatches: int
+    optimizer_steps: int
+    skipped_optimizer_steps: int
+    global_optimizer_step: int
+
+
+@dataclass(frozen=True)
+class ResumeState:
+    start_epoch: int
+    global_optimizer_step: int
+    mode: str
+
+
+class IncompatibleCheckpointError(RuntimeError):
+    """Raised when a versioned checkpoint cannot continue the current run."""
+
+
+def _seed_everything(seed: int = 42) -> None:
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -49,135 +97,116 @@ def _seed_everything(seed: int = 42):
 
 
 def _parse_args() -> argparse.Namespace:
-    """명령행 인수 파싱"""
-    ap = argparse.ArgumentParser("CAN‑BERT pre‑training (DDP 지원)")
-
-    # DDP 관련
-    ap.add_argument("--local_rank", type=int, default=-1, help="Local rank for DDP")
-    ap.add_argument("--seed", type=int, default=42, help="Random seed")
-
-    # 필수 I/O
-    ap.add_argument("--data_path", required=True, help="Training data path")
-    ap.add_argument("--vocab_path", required=True, help="Vocabulary file path")
-    ap.add_argument("--output_dir", default="checkpoints", help="Output directory")
-    ap.add_argument("--dataset_type", default="candump", help="Dataset type")
-    ap.add_argument("--resume_from_checkpoint", default=None, help="Checkpoint to resume from")
-
-    # 학습 하이퍼파라미터
-    ap.add_argument("--seq_len", type=int, default=126, help="Sequence length")
-    ap.add_argument("--batch_size", type=int, default=64, help="Batch size per GPU")
-    ap.add_argument("--epochs", type=int, default=5, help="Number of epochs")
-    ap.add_argument("--learning_rate", type=float, default=1e-3, help="Learning rate for pre-training (1e-3 recommended by CAN-BERT paper)")
-    ap.add_argument("--warmup_steps", type=int, default=1000, help="Warmup steps")
-    ap.add_argument("--mask_prob", type=float, default=0.45, help="Masking probability (0.45 recommended by CAN-BERT paper)")
-
-    # Teacher 모델 크기
-    ap.add_argument("--hidden_size", type=int, default=256, help="Hidden size")
-    ap.add_argument("--num_layers", type=int, default=4, help="Number of layers")
-    ap.add_argument("--num_heads", type=int, default=1, help="Number of attention heads")
-    ap.add_argument("--intermediate", type=int, default=512, help="Intermediate size")
-
-    # 시스템
-    ap.add_argument("--num_workers", type=int, default=os.cpu_count() // 2, help="DataLoader workers")
-    ap.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Gradient accumulation steps")
-
-    return ap.parse_args()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--local_rank", type=int, default=-1)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--data_path", required=True)
+    parser.add_argument("--vocab_path", required=True)
+    parser.add_argument("--output_dir", default="checkpoints")
+    parser.add_argument("--dataset_type", default="candump")
+    checkpoint_group = parser.add_mutually_exclusive_group()
+    checkpoint_group.add_argument(
+        "--resume_from_checkpoint",
+        help=(
+            "Continue optimizer, scheduler, scaler, epoch, and global-step state. "
+            "Legacy model-only checkpoints are loaded as an explicit warm start."
+        ),
+    )
+    checkpoint_group.add_argument(
+        "--warm_start_from_checkpoint",
+        help="Load model weights only and start a new training schedule",
+    )
+    parser.add_argument("--seq_len", type=int, default=126)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument(
+        "--epochs",
+        type=int,
+        default=5,
+        help="Total number of epochs, including completed resumed epochs",
+    )
+    parser.add_argument("--learning_rate", type=float, default=1e-3)
+    parser.add_argument("--warmup_steps", type=int, default=1000)
+    parser.add_argument("--mask_prob", type=float, default=0.45)
+    parser.add_argument("--hidden_size", type=int, default=256)
+    parser.add_argument("--num_layers", type=int, default=4)
+    parser.add_argument("--num_heads", type=int, default=1)
+    parser.add_argument("--intermediate", type=int, default=512)
+    parser.add_argument(
+        "--num_workers", type=int, default=max((os.cpu_count() or 1) // 2, 0)
+    )
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4)
+    args = parser.parse_args()
+    if args.epochs < 1:
+        parser.error("--epochs must be at least 1")
+    if args.gradient_accumulation_steps < 1:
+        parser.error("--gradient_accumulation_steps must be at least 1")
+    return args
 
 
 def _device() -> torch.device:
-    """기본 디바이스 반환"""
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 def _setup_ddp() -> Tuple[int, int, torch.device]:
-    """
-    DDP 환경 초기화
-    Returns:
-        rank: 글로벌 rank
-        local_rank: 로컬 rank  
-        device: CUDA 디바이스
-    """
     dist.init_process_group(backend="nccl")
-    
     rank = int(os.environ["RANK"])
     local_rank = int(os.environ["LOCAL_RANK"])
-    world_size = int(os.environ["WORLD_SIZE"])
-    
     device = torch.device(f"cuda:{local_rank}")
     torch.cuda.set_device(device)
-    
-    print(f"[RANK {rank}] Initialized DDP: rank={rank}, local_rank={local_rank}, world_size={world_size}")
     return rank, local_rank, device
 
 
 def _build_loader(
-    args: argparse.Namespace, 
-    tokenizer: CANTokenizer, 
-    rank: int = 0, 
-    world_size: int = 1
+    args: argparse.Namespace,
+    tokenizer: CANTokenizer,
+    rank: int = 0,
+    world_size: int = 1,
 ) -> Tuple[DataLoader, int]:
-    """
-    기본 DDP DataLoader 생성 (DistributedSampler 사용)
-    
-    Args:
-        args: 명령행 인수
-        tokenizer: CANTokenizer
-        rank: 현재 프로세스의 글로벌 rank
-        world_size: 전체 프로세스 수
-    Returns:
-        DataLoader, 총 스텝 수
-    """
-    # 데이터 로드 및 시퀀스 생성
-    df = load_can_data(args.data_path, dataset_type=args.dataset_type)
-    sequencer = CANSequencer(tokenizer, seq_len=args.seq_len, stride=1)
-    seqs = sequencer.transform(df)
-    
-    if not seqs:
-        raise RuntimeError("Sequencer produced no sequences.")
+    frame = load_can_data(args.data_path, dataset_type=args.dataset_type)
+    sequences = CANSequencer(tokenizer, seq_len=args.seq_len, stride=1).transform(
+        frame
+    )
+    if not sequences:
+        raise RuntimeError("Sequencer produced no sequences")
 
-    if rank == 0:
-        print(f"[INFO] Total sequences loaded: {len(seqs)}")
-
-    # MLM 데이터셋 생성
-    ds = MLMDataset(seqs, tokenizer, mask_prob=args.mask_prob)
-    
-    # DDP용 DistributedSampler 생성 (Map-style Dataset이므로 가능)
+    dataset = MLMDataset(sequences, tokenizer, mask_prob=args.mask_prob)
     if world_size > 1:
         sampler = DistributedSampler(
-            ds, 
-            num_replicas=world_size, 
-            rank=rank, 
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
             shuffle=True,
-            drop_last=True
+            drop_last=True,
         )
-        shuffle = False  # sampler가 있으면 shuffle=False
+        shuffle = False
     else:
         sampler = None
-        shuffle = True   # 단일 GPU에서는 shuffle=True
-    
-    # DataLoader 생성
+        shuffle = True
+
     loader = DataLoader(
-        ds,
+        dataset,
         batch_size=args.batch_size,
         sampler=sampler,
         shuffle=shuffle,
-        num_workers=args.num_workers or os.cpu_count() // 2,
-        pin_memory=True,
-        drop_last=True
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=True,
     )
-    
-    total_steps = len(loader)
+    if len(loader) == 0:
+        raise RuntimeError(
+            "Training dataloader is empty; reduce batch size or provide more data"
+        )
     if rank == 0:
-        print(f"[INFO] DataLoader created: {total_steps} steps per epoch")
-    
-    return loader, total_steps
+        print(
+            f"[INFO] loaded {len(sequences)} sequences in {len(loader)} microbatches"
+        )
+    return loader, len(loader)
 
 
 def _build_model(
     tokenizer: CANTokenizer, args: argparse.Namespace
 ) -> CANBertForMaskedLM:
-    """모델 생성"""
-    cfg = BertConfig(
+    config = BertConfig(
         vocab_size=tokenizer.vocab_size,
         hidden_size=args.hidden_size,
         num_hidden_layers=args.num_layers,
@@ -185,26 +214,52 @@ def _build_model(
         intermediate_size=args.intermediate,
         max_position_embeddings=args.seq_len,
     )
-    return CANBertForMaskedLM(cfg)
+    return CANBertForMaskedLM(config)
+
+
+def _optimizer_updates_per_epoch(
+    microbatches_per_epoch: int, gradient_accumulation_steps: int
+) -> int:
+    if microbatches_per_epoch < 1:
+        raise ValueError("microbatches_per_epoch must be at least 1")
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be at least 1")
+    return math.ceil(microbatches_per_epoch / gradient_accumulation_steps)
 
 
 def _build_optim_sched(
-    model: CANBertForMaskedLM,
+    model: torch.nn.Module,
     args: argparse.Namespace,
-    steps_per_epoch: int,
+    microbatches_per_epoch: int,
 ) -> Tuple[torch.optim.Optimizer, torch.optim.lr_scheduler.LambdaLR]:
-    """Optimizer & Scheduler 생성"""
-    optim = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
-    sched = get_linear_schedule_with_warmup(
-        optim,
-        num_warmup_steps=args.warmup_steps,
-        num_training_steps=steps_per_epoch * args.epochs,
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.learning_rate)
+    updates_per_epoch = _optimizer_updates_per_epoch(
+        microbatches_per_epoch, args.gradient_accumulation_steps
     )
-    return optim, sched
+    scheduler = get_linear_schedule_with_warmup(
+        optimizer,
+        num_warmup_steps=args.warmup_steps,
+        num_training_steps=updates_per_epoch * args.epochs,
+    )
+    return optimizer, scheduler
+
+
+def _build_grad_scaler(device: torch.device) -> Any:
+    enabled = device.type == "cuda"
+    try:
+        return torch.amp.GradScaler(device.type, enabled=enabled)
+    except (AttributeError, TypeError):
+        return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
+def _autocast_context(device: torch.device):
+    if device.type != "cuda":
+        return nullcontext()
+    return torch.autocast(device_type="cuda", dtype=torch.float16)
 
 
 def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
-    """Return the underlying model behind DDP and torch.compile wrappers."""
+    """Return the underlying model behind DDP and compile wrappers."""
     while True:
         if isinstance(model, DDP):
             model = model.module
@@ -216,246 +271,569 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
         return model
 
 
-# --------------------------------------------------------------------------- #
-# 2. DDP 훈련 루프                                                             #
-# --------------------------------------------------------------------------- #
+def _gradient_sync_context(model: torch.nn.Module, should_update: bool):
+    no_sync = getattr(model, "no_sync", None)
+    if not should_update and callable(no_sync):
+        return no_sync()
+    return nullcontext()
+
+
+def _optimizer_step_was_applied(scaler: Any, scale_before: float) -> bool:
+    """Use GradScaler's scale transition to detect an overflow-skipped step."""
+    return float(scaler.get_scale()) >= scale_before
+
 
 def _train_epoch(
-    model: DDP,
+    model: torch.nn.Module,
     loader: DataLoader,
     optim: torch.optim.Optimizer,
     sched: torch.optim.lr_scheduler.LambdaLR,
-    scaler: GradScaler,
+    scaler: Any,
     device: torch.device,
     epoch: int,
     end_epoch: int,
     rank: int,
     gradient_accumulation_steps: int = 1,
-) -> None:
-    """한 에포크 훈련"""
+    global_optimizer_step: int = 0,
+) -> TrainEpochResult:
+    """Train one epoch and step the scheduler only after applied updates."""
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient_accumulation_steps must be at least 1")
+    microbatch_count = len(loader)
+    if microbatch_count == 0:
+        raise ValueError("Training dataloader is empty")
+
     model.train()
-    
-    # DistributedSampler의 에포크 설정 (셔플링 다양화)
-    if hasattr(loader.sampler, 'set_epoch'):
+    if hasattr(loader.sampler, "set_epoch"):
         loader.sampler.set_epoch(epoch)
-    
-    # 진행률 표시는 rank 0에서만
-    if rank == 0:
-        prog = tqdm(loader, desc=f"Epoch {epoch+1}/{end_epoch}", leave=False)
-    else:
-        prog = loader
-    
-    total_loss = 0.0
-    num_steps = 0
-    
-    for step, batch in enumerate(prog):
-        # 배치를 GPU로 이동
-        batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
-        
-        # Mixed Precision Training
-        with autocast():
-            loss = model(**batch)[0]
-            # 그래디언트 축적을 위한 손실 스케일링
-            loss = loss / gradient_accumulation_steps
-        
-        # 그래디언트 스케일링 및 역전파
-        scaler.scale(loss).backward()
-        
-        sched.step()
-        
-        # 그래디언트 축적 단계에서만 옵티마이저 업데이트
-        if (step + 1) % gradient_accumulation_steps == 0:
+    progress = (
+        tqdm(loader, desc=f"Epoch {epoch + 1}/{end_epoch}", leave=False)
+        if rank == 0
+        else loader
+    )
+
+    raw_loss_total = 0.0
+    optimizer_steps = 0
+    skipped_optimizer_steps = 0
+    optim.zero_grad(set_to_none=True)
+
+    for step, batch in enumerate(progress):
+        group_start = (step // gradient_accumulation_steps) * gradient_accumulation_steps
+        group_size = min(
+            gradient_accumulation_steps, microbatch_count - group_start
+        )
+        should_update = (
+            (step + 1) % gradient_accumulation_steps == 0
+            or step + 1 == microbatch_count
+        )
+        batch = {
+            key: value.to(device, non_blocking=device.type == "cuda")
+            for key, value in batch.items()
+        }
+
+        with _gradient_sync_context(model, should_update):
+            with _autocast_context(device):
+                raw_loss = model(**batch)[0]
+                scaled_loss = raw_loss / group_size
+            scaler.scale(scaled_loss).backward()
+
+        if should_update:
             scaler.unscale_(optim)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+            scale_before = float(scaler.get_scale())
             scaler.step(optim)
             scaler.update()
-            optim.zero_grad()
-        
-        total_loss += loss.item()
-        num_steps += 1
-        
-        # 로그는 rank 0에서만
+            if _optimizer_step_was_applied(scaler, scale_before):
+                sched.step()
+                optimizer_steps += 1
+                global_optimizer_step += 1
+            else:
+                skipped_optimizer_steps += 1
+            optim.zero_grad(set_to_none=True)
+
+        raw_loss_value = float(raw_loss.detach().item())
+        raw_loss_total += raw_loss_value
         if rank == 0:
             if step % 100 == 0:
-                wandb.log({
-                    "train_loss": loss.item(), 
-                    "lr": sched.get_last_lr()[0],
-                    "epoch": epoch,
-                    "step": step
-                })
-            if isinstance(prog, tqdm):
-                prog.set_postfix(loss=f"{loss.item():.4f}")
-    
-    # 에포크 평균 손실 계산
-    avg_loss = total_loss / num_steps if num_steps > 0 else 0.0
-    
+                wandb.log(
+                    {
+                        "train/raw_loss": raw_loss_value,
+                        "train/scaled_loss": float(scaled_loss.detach().item()),
+                        "train/lr": sched.get_last_lr()[0],
+                        "train/epoch": epoch,
+                        "train/microbatch": step,
+                        "train/global_optimizer_step": global_optimizer_step,
+                    }
+                )
+            if isinstance(progress, tqdm):
+                progress.set_postfix(loss=f"{raw_loss_value:.4f}")
+
+    result = TrainEpochResult(
+        average_raw_loss=raw_loss_total / microbatch_count,
+        microbatches=microbatch_count,
+        optimizer_steps=optimizer_steps,
+        skipped_optimizer_steps=skipped_optimizer_steps,
+        global_optimizer_step=global_optimizer_step,
+    )
     if rank == 0:
-        print(f"[EPOCH {epoch+1}] Average Loss: {avg_loss:.4f}")
+        print(
+            f"[EPOCH {epoch + 1}] raw_loss={result.average_raw_loss:.4f}, "
+            f"optimizer_steps={result.optimizer_steps}, "
+            f"overflow_skips={result.skipped_optimizer_steps}"
+        )
+    return result
+
+
+def _model_config(model: torch.nn.Module) -> dict[str, Any]:
+    config = getattr(_unwrap_model(model), "config", None)
+    if config is None or not hasattr(config, "to_dict"):
+        return {}
+    serialized = config.to_dict()
+    serialized.setdefault(
+        "position_embedding_type",
+        getattr(config, "position_embedding_type", "absolute"),
+    )
+    return serialized
+
+
+def _require_mapping(value: Any, label: str) -> Mapping[str, Any]:
+    if not isinstance(value, Mapping):
+        raise IncompatibleCheckpointError(f"{label} must be a mapping")
+    return value
+
+
+def _non_negative_int(value: Any, label: str) -> int:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise IncompatibleCheckpointError(f"{label} must be a non-negative integer")
+    return value
+
+
+def _validate_scheduler_global_step(
+    scheduler_state: Any, global_optimizer_step: Any
+) -> int:
+    state = _require_mapping(scheduler_state, "Scheduler state")
+    global_step = _non_negative_int(
+        global_optimizer_step, "Global optimizer step"
+    )
+    last_epoch = _non_negative_int(
+        state.get("last_epoch"), "Scheduler last_epoch"
+    )
+    if last_epoch != global_step:
+        raise IncompatibleCheckpointError(
+            "Scheduler state is incompatible with global optimizer step: "
+            f"last_epoch={last_epoch}, global_optimizer_step={global_step}"
+        )
+    return global_step
 
 
 def _save_checkpoint(
     model: torch.nn.Module,
     optim: torch.optim.Optimizer,
     sched: torch.optim.lr_scheduler.LambdaLR,
+    scaler: Any,
     epoch: int,
+    global_optimizer_step: int,
     out_dir: Path,
     rank: int,
-) -> Path:
-    """체크포인트 저장 (rank 0에서만)"""
+    training_config: Mapping[str, Any],
+) -> Path | None:
+    """Save a versioned, fully resumable checkpoint on rank zero."""
     if rank != 0:
         return None
-    
+
+    epoch = _non_negative_int(epoch, "Epoch index")
+    scheduler_state = sched.state_dict()
+    global_optimizer_step = _validate_scheduler_global_step(
+        scheduler_state, global_optimizer_step
+    )
+    _validate_training_config(training_config, None)
+    model_config = _model_config(model)
+    _validate_model_config(model_config, model_config)
+
     out_dir.mkdir(parents=True, exist_ok=True)
-    ckpt_path = out_dir / f"can-bert-pretrained-epoch-{epoch+1}.pt"
-    
-    # Wrapper 접두사가 없는 state dict를 저장해 fine-tuning과 재개에서 공유합니다.
+    checkpoint_path = out_dir / f"can-bert-pretrained-epoch-{epoch + 1}.pt"
     torch.save(
         {
-            "epoch": epoch + 1,  # 다음 epoch부터 재개
-            "model": _unwrap_model(model).state_dict(),
-            "optim_state": optim.state_dict(),
-            "sched_state": sched.state_dict(),
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "checkpoint_type": CHECKPOINT_TYPE,
+            "epoch": epoch + 1,
+            "global_optimizer_step": global_optimizer_step,
+            "model_state_dict": _unwrap_model(model).state_dict(),
+            "optimizer_state_dict": optim.state_dict(),
+            "scheduler_state_dict": scheduler_state,
+            "scaler_state_dict": scaler.state_dict(),
+            "model_config": model_config,
+            "training_config": dict(training_config),
         },
-        ckpt_path,
+        checkpoint_path,
     )
-    
-    print(f"[INFO] Checkpoint saved → {ckpt_path}")
-    return ckpt_path
+    print(f"[INFO] checkpoint saved -> {checkpoint_path}")
+    return checkpoint_path
+
+
+def _legacy_model_state(checkpoint: Any) -> Mapping[str, torch.Tensor]:
+    if not isinstance(checkpoint, Mapping):
+        raise IncompatibleCheckpointError("Checkpoint payload is not a mapping")
+    for key in ("model_state_dict", "model", "state_dict"):
+        candidate = checkpoint.get(key)
+        if isinstance(candidate, Mapping):
+            return candidate
+    if checkpoint and all(torch.is_tensor(value) for value in checkpoint.values()):
+        return checkpoint
+    raise IncompatibleCheckpointError("Checkpoint does not contain model weights")
+
+
+def _move_value_to_device(value: Any, device: torch.device) -> Any:
+    if torch.is_tensor(value):
+        return value.to(device)
+    if isinstance(value, dict):
+        return {
+            key: _move_value_to_device(nested, device)
+            for key, nested in value.items()
+        }
+    if isinstance(value, list):
+        return [_move_value_to_device(nested, device) for nested in value]
+    if isinstance(value, tuple):
+        return tuple(_move_value_to_device(nested, device) for nested in value)
+    return value
+
+
+def _move_optimizer_state(
+    optimizer: torch.optim.Optimizer, device: torch.device
+) -> None:
+    for parameter, state in optimizer.state.items():
+        optimizer.state[parameter] = _move_value_to_device(state, device)
+
+
+def _valid_sha256(value: Any) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value == value.casefold()
+        and all(character in "0123456789abcdef" for character in value)
+    )
+
+
+def _validate_training_config(stored: Any, expected: Any | None) -> None:
+    stored = _require_mapping(stored, "Training configuration")
+    missing = [key for key in TRAINING_CONFIG_REQUIRED_KEYS if key not in stored]
+    if missing:
+        raise IncompatibleCheckpointError(
+            "Training configuration is incomplete: " + ", ".join(missing)
+        )
+    for hash_key in ("vocab_sha256", "dataset_sha256"):
+        if not _valid_sha256(stored[hash_key]):
+            raise IncompatibleCheckpointError(
+                f"Training configuration has invalid {hash_key}"
+            )
+    if expected is None:
+        return
+    expected = _require_mapping(expected, "Expected training configuration")
+    missing = [key for key in TRAINING_CONFIG_REQUIRED_KEYS if key not in expected]
+    if missing:
+        raise IncompatibleCheckpointError(
+            "Expected training configuration is incomplete: " + ", ".join(missing)
+        )
+    for hash_key in ("vocab_sha256", "dataset_sha256"):
+        if not _valid_sha256(expected[hash_key]):
+            raise IncompatibleCheckpointError(
+                f"Expected training configuration has invalid {hash_key}"
+            )
+    mismatches = [
+        key
+        for key, expected_value in expected.items()
+        if stored.get(key) != expected_value
+    ]
+    if mismatches:
+        details = ", ".join(
+            f"{key}: checkpoint={stored.get(key)!r}, current={expected[key]!r}"
+            for key in mismatches
+        )
+        raise IncompatibleCheckpointError(
+            "Training configuration is incompatible with the checkpoint: " + details
+        )
+
+
+def _validate_model_config(stored: Any, current: Any) -> None:
+    stored = _require_mapping(stored, "Checkpoint model configuration")
+    current = _require_mapping(current, "Current model configuration")
+    stored_missing = [key for key in MODEL_CONFIG_REQUIRED_KEYS if key not in stored]
+    current_missing = [key for key in MODEL_CONFIG_REQUIRED_KEYS if key not in current]
+    if stored_missing or current_missing:
+        details = []
+        if stored_missing:
+            details.append("checkpoint missing " + ", ".join(stored_missing))
+        if current_missing:
+            details.append("current model missing " + ", ".join(current_missing))
+        raise IncompatibleCheckpointError(
+            "Model architecture is incompatible with the checkpoint: "
+            + "; ".join(details)
+        )
+    mismatches = [
+        key
+        for key in MODEL_CONFIG_REQUIRED_KEYS
+        if stored[key] != current[key]
+    ]
+    if mismatches:
+        details = ", ".join(
+            f"{key}: checkpoint={stored.get(key)!r}, current={current.get(key)!r}"
+            for key in mismatches
+        )
+        raise IncompatibleCheckpointError(
+            "Model architecture is incompatible with the checkpoint: " + details
+        )
 
 
 def _load_checkpoint(
-    model: CANBertForMaskedLM,
+    model: torch.nn.Module,
     optim: torch.optim.Optimizer,
     sched: torch.optim.lr_scheduler.LambdaLR,
-    ckpt_path: str,
+    scaler: Any,
+    ckpt_path: str | Path,
     device: torch.device,
     rank: int,
-) -> int:
-    """체크포인트 로드"""
-    if not Path(ckpt_path).is_file():
-        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
-    
+    expected_training_config: Mapping[str, Any] | None = None,
+    force_warm_start: bool = False,
+) -> ResumeState:
+    """Load true-resume state or explicitly fall back to legacy warm start."""
+    checkpoint_path = Path(ckpt_path)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint not found: {checkpoint_path}")
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+
+    schema_version = (
+        checkpoint.get("schema_version") if isinstance(checkpoint, Mapping) else None
+    )
+    if force_warm_start or schema_version is None:
+        state = _legacy_model_state(checkpoint)
+        try:
+            _unwrap_model(model).load_state_dict(state, strict=True)
+        except RuntimeError as error:
+            raise IncompatibleCheckpointError(
+                f"Warm-start model weights are incompatible: {error}"
+            ) from error
+        mode = "forced-warm-start" if force_warm_start else "legacy-warm-start"
+        if rank == 0:
+            print(
+                f"[WARM START] loaded model weights from {checkpoint_path}; "
+                "optimizer, scheduler, scaler, epoch, and global step were reset"
+            )
+        return ResumeState(0, 0, mode)
+
+    if schema_version != CHECKPOINT_SCHEMA_VERSION:
+        raise IncompatibleCheckpointError(
+            f"Unsupported checkpoint schema {schema_version!r}; "
+            f"expected {CHECKPOINT_SCHEMA_VERSION}"
+        )
+    required = {
+        "checkpoint_type",
+        "epoch",
+        "global_optimizer_step",
+        "model_state_dict",
+        "optimizer_state_dict",
+        "scheduler_state_dict",
+        "scaler_state_dict",
+        "model_config",
+        "training_config",
+    }
+    missing = sorted(required - checkpoint.keys())
+    if missing:
+        raise IncompatibleCheckpointError(
+            "Versioned checkpoint is incomplete: " + ", ".join(missing)
+        )
+    if checkpoint["checkpoint_type"] != CHECKPOINT_TYPE:
+        raise IncompatibleCheckpointError(
+            f"Unexpected checkpoint type: {checkpoint['checkpoint_type']!r}"
+        )
+    for key in (
+        "model_state_dict",
+        "optimizer_state_dict",
+        "scheduler_state_dict",
+        "scaler_state_dict",
+        "model_config",
+        "training_config",
+    ):
+        _require_mapping(checkpoint[key], f"Checkpoint field {key}")
+    start_epoch = _non_negative_int(checkpoint["epoch"], "Checkpoint epoch")
+    global_step = _validate_scheduler_global_step(
+        checkpoint["scheduler_state_dict"], checkpoint["global_optimizer_step"]
+    )
+    _validate_training_config(
+        checkpoint["training_config"], expected_training_config
+    )
+    _validate_model_config(checkpoint["model_config"], _model_config(model))
+
+    try:
+        _unwrap_model(model).load_state_dict(
+            checkpoint["model_state_dict"], strict=True
+        )
+        optim.load_state_dict(checkpoint["optimizer_state_dict"])
+        _move_optimizer_state(optim, device)
+        sched.load_state_dict(checkpoint["scheduler_state_dict"])
+        scaler.load_state_dict(checkpoint["scaler_state_dict"])
+    except (KeyError, RuntimeError, ValueError) as error:
+        raise IncompatibleCheckpointError(
+            f"Versioned checkpoint state is incompatible: {error}"
+        ) from error
+
+    _validate_scheduler_global_step(sched.state_dict(), global_step)
     if rank == 0:
-        print(f"[INFO] Loading checkpoint from {ckpt_path}")
-    
-    # 모든 rank에서 체크포인트 로드
-    ckpt = torch.load(ckpt_path, map_location=device)
-    
-    # compile/DDP wrapper가 아닌 원본 모듈에 상태를 로드합니다.
-    _unwrap_model(model).load_state_dict(ckpt["model"])
-    
-    # Optimizer, Scheduler는 새로운 데이터에 맞춰 재생성되므로
-    # 이전 상태는 로드하지 않음 (사용자 요구사항에 따라)
-    
-    start_epoch = ckpt["epoch"]
-    if rank == 0:
-        print(f"[INFO] Resumed from epoch {start_epoch}")
-    
-    return start_epoch
+        print(
+            f"[TRUE RESUME] epoch={start_epoch}, "
+            f"global_optimizer_step={global_step}, source={checkpoint_path}"
+        )
+    return ResumeState(start_epoch, global_step, "true-resume")
 
 
-# --------------------------------------------------------------------------- #
-# 3. 메인 함수                                                                #
-# --------------------------------------------------------------------------- #
+def _sha256_file(path: str | Path) -> str:
+    source = Path(path)
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    digest = hashlib.sha256()
+    with source.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _training_config(
+    args: argparse.Namespace,
+    microbatches_per_epoch: int,
+    world_size: int,
+    scaler: Any,
+) -> dict[str, Any]:
+    updates_per_epoch = _optimizer_updates_per_epoch(
+        microbatches_per_epoch, args.gradient_accumulation_steps
+    )
+    return {
+        "microbatches_per_epoch": microbatches_per_epoch,
+        "gradient_accumulation_steps": args.gradient_accumulation_steps,
+        "updates_per_epoch": updates_per_epoch,
+        "total_epochs": args.epochs,
+        "total_optimizer_steps": updates_per_epoch * args.epochs,
+        "warmup_steps": args.warmup_steps,
+        "learning_rate": args.learning_rate,
+        "mask_prob": args.mask_prob,
+        "batch_size": args.batch_size,
+        "seed": args.seed,
+        "world_size": world_size,
+        "amp_enabled": bool(scaler.is_enabled()),
+        "seq_len": args.seq_len,
+        "dataset_type": args.dataset_type,
+        "vocab_sha256": _sha256_file(args.vocab_path),
+        "dataset_sha256": _sha256_file(args.data_path),
+    }
+
 
 def main() -> None:
-    """메인 함수"""
     args = _parse_args()
-    
-    # DDP 환경 체크 및 초기화
-    is_ddp = "WORLD_SIZE" in os.environ
-    
+    is_ddp = int(os.environ.get("WORLD_SIZE", "1")) > 1
     if is_ddp:
         rank, local_rank, device = _setup_ddp()
         world_size = int(os.environ["WORLD_SIZE"])
-        # 각 rank마다 다른 시드로 데이터 다양성 확보
         _seed_everything(args.seed + rank)
     else:
-        rank, world_size = 0, 1
+        rank, local_rank, world_size = 0, -1, 1
         device = _device()
         _seed_everything(args.seed)
-        print("[INFO] Running in single GPU mode")
-    
-    # W&B 초기화 (rank 0에서만)
+
     if rank == 0:
         wandb.init(
-            project="CAN-IDS-DDP-Pretrain", 
-            config=vars(args), 
+            project="CAN-IDS-DDP-Pretrain",
+            config=vars(args),
             mode="offline",
-            name=f"ddp-{world_size}gpu" if is_ddp else "single-gpu"
+            name=f"ddp-{world_size}gpu" if is_ddp else "single-process",
         )
-    
-    # 토크나이저 로드
+
     tokenizer = CANTokenizer()
     tokenizer.load_vocab(args.vocab_path)
-    
-    # 데이터로더 생성
-    loader, steps_per_epoch = _build_loader(args, tokenizer, rank, world_size)
-    
-    # 모델 생성 및 GPU로 이동
+    loader, microbatches_per_epoch = _build_loader(
+        args, tokenizer, rank, world_size
+    )
     model = _build_model(tokenizer, args).to(device)
-    
-    # torch.compile() 적용 (PyTorch 2.0+)
-    if hasattr(torch, 'compile') and torch.__version__.startswith('2.'):
+    if hasattr(torch, "compile") and torch.__version__.startswith("2."):
         model = torch.compile(model)
         if rank == 0:
-            print("[INFO] Model compiled with torch.compile()")
-    
-    # Optimizer & Scheduler 생성
-    optim, sched = _build_optim_sched(model, args, steps_per_epoch)
-    
-    # Mixed Precision Scaler
-    scaler = GradScaler() if device.type == "cuda" else None
-    
-    # 체크포인트 로드
-    start_epoch = 0
+            print("[INFO] model compiled")
+
+    optim, sched = _build_optim_sched(model, args, microbatches_per_epoch)
+    scaler = _build_grad_scaler(device)
+    training_config = _training_config(
+        args, microbatches_per_epoch, world_size, scaler
+    )
+
+    resume_state = ResumeState(0, 0, "new-run")
     if args.resume_from_checkpoint:
-        start_epoch = _load_checkpoint(
-            model, optim, sched, args.resume_from_checkpoint, device, rank
+        resume_state = _load_checkpoint(
+            model,
+            optim,
+            sched,
+            scaler,
+            args.resume_from_checkpoint,
+            device,
+            rank,
+            expected_training_config=training_config,
         )
-    
-    # DDP로 모델 래핑 (find_unused_parameters=True로 BertModel pooler 문제 해결)
+    elif args.warm_start_from_checkpoint:
+        resume_state = _load_checkpoint(
+            model,
+            optim,
+            sched,
+            scaler,
+            args.warm_start_from_checkpoint,
+            device,
+            rank,
+            force_warm_start=True,
+        )
+
+    if resume_state.start_epoch > args.epochs:
+        raise ValueError(
+            f"Checkpoint epoch {resume_state.start_epoch} exceeds --epochs {args.epochs}"
+        )
+
     if is_ddp:
         model = DDP(
-            model, 
-            device_ids=[local_rank], 
+            model,
+            device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=True  # ← 핵심: BertModel pooler 미사용 문제 해결
+            find_unused_parameters=True,
         )
-        if rank == 0:
-            print("[INFO] Model wrapped with DDP (find_unused_parameters=True)")
-    
-    # 훈련 루프
-    target_epoch = start_epoch + args.epochs
-    
-    if rank == 0:
-        print(f"[INFO] Training from epoch {start_epoch} to {target_epoch - 1}")
-        print(f"[INFO] Steps per epoch: {steps_per_epoch}")
-        print(f"[INFO] Total training steps: {steps_per_epoch * args.epochs}")
-    
-    for epoch in range(start_epoch, target_epoch):
-        # 훈련
-        _train_epoch(
-            model, loader, optim, sched, scaler, 
-            device, epoch, target_epoch, rank, args.gradient_accumulation_steps
+
+    global_optimizer_step = resume_state.global_optimizer_step
+    for epoch in range(resume_state.start_epoch, args.epochs):
+        result = _train_epoch(
+            model,
+            loader,
+            optim,
+            sched,
+            scaler,
+            device,
+            epoch,
+            args.epochs,
+            rank,
+            args.gradient_accumulation_steps,
+            global_optimizer_step,
         )
-        
-        # DDP 동기화 (모든 프로세스가 에포크 완료 대기)
+        global_optimizer_step = result.global_optimizer_step
         if is_ddp:
             dist.barrier()
-        
-        # 체크포인트 저장 (rank 0에서만)
-        _save_checkpoint(model, optim, sched, epoch, Path(args.output_dir), rank)
-        
-        # 다시 동기화
+        _save_checkpoint(
+            model,
+            optim,
+            sched,
+            scaler,
+            epoch,
+            global_optimizer_step,
+            Path(args.output_dir),
+            rank,
+            training_config,
+        )
         if is_ddp:
             dist.barrier()
-    
+
     if rank == 0:
-        print("[INFO] Pre‑training finished.")
+        print("[INFO] pre-training finished")
         wandb.finish()
-    
-    # DDP 정리
     if is_ddp:
         dist.destroy_process_group()
 

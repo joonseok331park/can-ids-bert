@@ -2,45 +2,34 @@
 
 `candump` 로그의 CAN ID와 페이로드를 토큰화해 BERT masked language model(MLM)을 사전 학습하고, Benign·DoS·Fuzzy·Malfunction 네 클래스로 미세 조정하는 연구용 코드입니다. 공개 범위는 teacher model 실험 파이프라인까지이며, 차량 탑재용 제품이나 검증된 실시간 탐지기를 제공하지 않습니다.
 
-## 구현 범위
-
-- `candump` 행 파싱과 CAN ID·0–8 byte 페이로드 검증
-- 특수 토큰, 256개 byte 토큰, 데이터 기반 CAN ID 토큰으로 구성한 어휘
-- 고정 길이 시퀀스와 MLM 동적 마스킹
-- Transformers 기반 BERT MLM teacher와 4-class classifier
-- 데이터 병합·분할, 어휘 생성, 사전 학습, 미세 조정 스크립트
-
 학습 데이터, 학습된 가중치, 성능 결과, student model, knowledge distillation, ONNX export 및 배포 런타임은 이 저장소에 포함하지 않습니다.
 
-## 코드 구성
+## 구현 범위
+
+- 11-bit/29-bit CAN ID, 0–8 byte payload, 완전한 행 일치를 검사하는 공통 `candump` parser
+- 특수 토큰, 256개 byte 토큰, 검증된 CAN ID 토큰으로 구성한 어휘
+- 고정 길이 시퀀스와 MLM 동적 마스킹
+- Transformers 기반 BERT MLM teacher와 고정 4-class classifier
+- 파일 경계를 유지하는 분류 시퀀스와 source file/line provenance
+- 실제 optimizer update에 맞춘 gradient accumulation, scheduler, AMP overflow 처리
+- versioned full-state resume와 legacy model-only warm start
+- 정렬된 데이터 병합, 파일 단위 split, SHA-256 manifest
 
 ```text
-core/       tokenizer, sequencer, MLM/classification datasets
+core/       tokenizer, sequencer, MLM/classification datasets, class constants
 models/     MLM teacher and four-class classifier
 scripts/    data preparation, pretraining, and fine-tuning entry points
-utils/      candump parser and data loading
-tests/      synthetic parser, tokenizer, dataset, and model smoke tests
+utils/      canonical candump parser and data loading
+tests/      smoke tests and training/data integrity tests
 ```
 
-처리 흐름은 다음과 같습니다.
+## 환경
 
-```text
-candump logs
-  -> scripts.aggregate_data
-  -> scripts.build_vocab
-  -> scripts.split_data
-  -> scripts.pretrain
-  -> scripts.prepare_finetune_data
-  -> scripts.finetune
-```
-
-## 환경과 최소 검증
-
-- Python 3.12 (CI와 현재 smoke test 기준)
+- Python 3.12
 - 학습에는 PyTorch와 `requirements.txt`의 패키지 필요
-- 문서화한 분산 사전 학습 경로는 Linux, CUDA, NCCL 환경을 전제로 함
+- 분산 사전 학습 경로는 Linux, CUDA, NCCL 환경을 전제로 함
 
-GPU 환경에 맞는 PyTorch를 [공식 설치 안내](https://pytorch.org/get-started/locally/)에 따라 먼저 설치한 뒤 나머지 의존성을 설치합니다.
+GPU 환경에 맞는 PyTorch를 [공식 설치 안내](https://pytorch.org/get-started/locally/)에 따라 먼저 설치합니다. CPU 전용 의존성 검증 예시는 다음과 같습니다.
 
 ```bash
 python -m venv .venv
@@ -48,20 +37,14 @@ python -m venv .venv
 python -m pip install --upgrade pip
 python -m pip install torch==2.13.0+cpu --index-url https://download.pytorch.org/whl/cpu
 python -m pip install -r requirements.txt
+python -m pip check
 ```
 
-데이터가 없어도 다음 검사를 실행할 수 있습니다.
+## Canonical parser와 vocabulary
 
-```bash
-python -m compileall core models scripts utils
-python -m unittest discover -s tests -v
-```
+모든 로더와 vocabulary builder는 `utils.data_loader.parse_candump_line`을 사용합니다. parser는 CAN ID와 payload를 대문자로 정규화하고, 29-bit 상한·payload 길이·행 끝까지 검사합니다. 스캔 결과는 valid/rejected/total count로 보고되며, 유효한 frame이 하나도 없으면 중단합니다. Vocabulary에는 공개 API `CANTokenizer.add_can_ids()`로 검증된 ID만 추가합니다.
 
-테스트는 작은 합성 입력으로 parser/tokenizer/dataset 동작과 teacher model의 CPU forward shape를 확인합니다. 실제 데이터 학습이나 성능 재현을 대신하지 않습니다.
-
-## 데이터와 학습 산출물
-
-원본 CAN 로그는 데이터 사용 권한과 크기 때문에 공개 저장소에 넣지 않습니다. `dataset/`, 생성된 `data/`, 어휘와 모델 체크포인트가 저장되는 `checkpoints/`, W&B 로그는 Git에서 제외됩니다. 어휘는 사용자가 권한을 보유한 입력 데이터에서 다시 생성해야 합니다.
+이 parser로 다시 만든 canonical vocabulary는 이전 정규식 기반 vocabulary와 token index 또는 hash가 달라질 수 있습니다. 새 vocabulary와 기존 checkpoint를 혼용하지 말고 별도 artifact lineage로 관리합니다.
 
 예상 입력 행:
 
@@ -69,36 +52,140 @@ python -m unittest discover -s tests -v
 (1613599955.394625) can0 0C8#0000000000000000
 ```
 
-기본 데이터 준비 명령:
+## 결정론적 데이터 준비
+
+원본 CAN 로그는 데이터 사용 권한과 크기 때문에 공개 저장소에 넣지 않습니다. `dataset/`, 생성된 `data/`, `checkpoints/`, W&B 로그는 Git에서 제외됩니다.
+
+병합 입력은 정규화된 상대 경로 순으로 처리합니다. 출력 디렉터리가 비어 있지 않으면 기본 동작은 실패이며, 기존 생성물의 교체를 의도한 경우에만 `--overwrite`를 사용합니다.
 
 ```bash
-python -m scripts.aggregate_data
-python -m scripts.build_vocab
+python -m scripts.aggregate_data \
+  --source-dir "dataset/CAN-MIRGU(train)/Benign" \
+  --output-file data/HCRL_dataset/train_aggregated.log
+
+python -m scripts.build_vocab \
+  --data-file data/HCRL_dataset/train_aggregated.log \
+  --output checkpoints/vocab.json
+
 python -m scripts.split_data
 ```
 
-생성한 어휘와 입력 경로를 명시해 단일 프로세스 분산 실행 흐름을 확인할 수 있습니다.
+`aggregate_manifest.json`에는 정렬된 source relative path, source SHA-256, output SHA-256가 기록됩니다. 병합 출력은 경로를 정규화한 뒤 source tree와 같은 위치이거나 그 내부이면 거부합니다. `..` 또는 symlink를 거친 경로도 실제 위치를 기준으로 검사하며, 이 검사는 출력 디렉터리를 만들거나 기존 파일을 교체하기 전에 수행됩니다.
+
+미세 조정 split은 source file 단위로 수행합니다. 각 클래스에 최소 세 파일이 있어야 하며, train/validation/test에 각 클래스가 하나 이상 포함되고 한 source가 두 split에 중복되지 않는지 확인합니다.
+
+```bash
+python -m scripts.prepare_finetune_data \
+  --dataset-dir "dataset/CAN-MIRGU(train)" \
+  --output-dir data/finetune_data \
+  --seed 42 --train-ratio 0.7 --val-ratio 0.15 \
+  --link-mode copy
+```
+
+`split_manifest.json`에는 class, split, source relative path, target relative path, materialization 방식, source SHA-256, ratio와 클래스별 유효 seed가 기록됩니다. 유효 seed는 기본 seed에 고정된 `CLASS_NAMES` index를 더해 계산합니다. `Real_attacks` 파일명은 `dos`, `fuzz`, `malfunction` 중 정확히 한 규칙에 일치해야 합니다. `Masquerade_attacks`와 `Suspension_attacks` 디렉터리는 Malfunction으로 분류합니다. 그 밖의 파일은 자동으로 Malfunction에 넣지 않고 오류로 보고합니다.
+
+`--dataset-dir`와 `--output-dir`는 서로 분리된 sibling tree여야 합니다. 두 경로가 같거나 어느 한쪽이 다른 쪽의 부모이면 원본 스캔이나 출력 변경 전에 중단합니다.
+
+정렬·최소 개수·고정 seed 규칙을 적용한 split은 이전 스크립트의 결과와 달라질 수 있으므로 기존 실험과 별도 lineage로 취급합니다.
+
+같은 출력의 재생성을 명시하려면 위 데이터 준비 명령에 `--overwrite`를 추가합니다. 이때 기존 트리 전체가 manifest에 기록된 파일과 정확히 일치해야 하며, 중첩된 미등록 파일이나 누락된 파일이 있으면 중단합니다. 새 split은 형제 staging 디렉터리에 모두 만든 뒤 교체하므로 생성 실패 시 기존 출력은 유지됩니다.
+
+## 사전 학습과 체크포인트
+
+`gradient_accumulation_steps`가 loader 길이를 나누어 떨어뜨리지 않아도 각 epoch의 마지막 잔여 microbatch 묶음을 update합니다. Loss log는 축적용 scaled loss와 원래 raw loss를 구분합니다. Gradient clipping은 optimizer update 직전에 수행하며 scheduler와 global optimizer step은 AMP overflow로 건너뛴 update에서는 증가하지 않습니다. DDP의 update가 아닌 microbatch에는 `no_sync()`를 사용합니다.
+
+새 실행 예시입니다. `--epochs`는 재개 전후를 합친 총 epoch 수입니다.
 
 ```bash
 torchrun --standalone --nproc_per_node=1 -m scripts.pretrain \
   --data_path data/aggregated_parts/part_00 \
   --vocab_path checkpoints/vocab.json \
   --output_dir checkpoints \
-  --epochs 1 --batch_size 32 --num_workers 4
+  --epochs 5 --batch_size 32 --num_workers 4 \
+  --gradient_accumulation_steps 4
 ```
 
-4-class 데이터 분할과 미세 조정:
+Schema version 2 체크포인트는 model, optimizer, scheduler, AMP scaler, 다음 epoch, global optimizer step, model/training config를 저장합니다. Training config에는 vocabulary와 dataset 내용의 SHA-256, masking 확률, batch size, seed, world size, AMP 여부, sequence 길이와 dataset type이 포함됩니다. Resume은 이 값과 forward semantics에 영향을 주는 model config가 모두 같고 scheduler step이 global optimizer step과 일치할 때만 허용됩니다. 같은 입력과 설정으로 계속하려면 다음과 같이 full-state resume을 사용합니다.
 
 ```bash
-python -m scripts.prepare_finetune_data
+torchrun --standalone --nproc_per_node=1 -m scripts.pretrain \
+  --data_path data/aggregated_parts/part_00 \
+  --vocab_path checkpoints/vocab.json \
+  --output_dir checkpoints \
+  --epochs 5 --batch_size 32 --num_workers 4 \
+  --gradient_accumulation_steps 4 \
+  --resume_from_checkpoint checkpoints/can-bert-pretrained-epoch-2.pt
+```
+
+이전 model-only 또는 schema 없는 체크포인트는 optimizer/scheduler 상태가 호환된다고 간주하지 않습니다. `--resume_from_checkpoint`로 읽으면 명시적인 legacy warm start log를 남기며 새 schedule로 시작합니다. 이를 처음부터 의도한 경우에는 `--warm_start_from_checkpoint`를 사용합니다.
+
+```bash
+python -m scripts.pretrain \
+  --data_path data/aggregated_parts/part_00 \
+  --vocab_path checkpoints/vocab.json \
+  --epochs 5 \
+  --warm_start_from_checkpoint checkpoints/legacy-model-only.pt
+```
+
+체크포인트는 Python, NumPy, PyTorch의 RNG 상태를 저장하지 않으므로 bitwise-identical continuation을 주장하지 않습니다.
+
+## 4-class 미세 조정
+
+분류 시퀀스는 source file 경계를 넘지 않습니다. 각 source file은 파일명에서 결정된 하나의 label만 가지며 sequence provenance에는 source file과 시작/끝 line이 남습니다. 한 sequence를 만들기에 짧은 파일은 기본적으로 제외하며 파일 수를 보고합니다. 엄격히 중단하려면 `--short_file_policy error`를 명시합니다. 모든 파일이 제외되면 중단합니다.
+
+Class name과 label은 항상 `Benign=0`, `DoS=1`, `Fuzzy=2`, `Malfunction=3`입니다. 학습 split에 한 클래스라도 없으면 class weight 계산을 중단합니다. Metric과 confusion matrix는 sparse prediction에서도 고정 label 네 개와 4×4 shape를 사용합니다.
+
+```bash
 python -m scripts.finetune \
   --train_data_dir data/finetune_data/train \
   --val_data_dir data/finetune_data/validation \
   --test_data_dir data/finetune_data/test \
   --vocab_path checkpoints/vocab.json \
-  --resume_from_checkpoint checkpoints/can-bert-pretrained-epoch-1.pt \
+  --pretrained_checkpoint checkpoints/can-bert-pretrained-epoch-5.pt \
+  --output_dir checkpoints \
+  --short_file_policy skip
+```
+
+일반 `--pretrained_checkpoint` 경로는 `schema_version=2`, `checkpoint_type=can-bert-pretrain`인 사전 학습 체크포인트만 허용합니다. 체크포인트의 `training_config.vocab_sha256`가 올바른 소문자 SHA-256이고 현재 `--vocab_path` 파일 내용의 해시와 정확히 같아야 합니다. 또한 `hidden_act`, dropout, position embedding 설정을 포함해 BERT forward semantics에 영향을 주는 model config 필드가 모두 현재 분류 모델과 일치해야 합니다. Vocabulary 크기만 같은 다른 파일이나 metadata가 누락된 체크포인트는 가중치를 적용하기 전에 거부합니다.
+
+Schema가 없는 이전 체크포인트는 일반 옵션으로 자동 이관하지 않습니다. 이 artifact의 vocabulary와 model config lineage를 별도로 확인한 경우에만 상호 배타적인 `--legacy_pretrained_checkpoint`를 명시합니다. 이 경로는 checkpoint metadata로 vocabulary semantic compatibility를 검증할 수 없고 weights-only initialization만 수행한다는 경고와 함께, 사용자가 현재 `--vocab_path`와 동일한 vocabulary lineage인지 별도로 확인해야 한다고 명시합니다. Optimizer 등의 상태는 사용하지 않으며 BERT body의 key와 tensor shape가 완전히 일치하는 가중치만 불러옵니다. `schema_version` key가 하나라도 있는 체크포인트는 v2, 미래 schema, 잘못된 type 여부와 관계없이 legacy 경로에서 거부되며, 반드시 `--pretrained_checkpoint` 검증을 통과해야 합니다.
+
+```bash
+python -m scripts.finetune \
+  --train_data_dir data/finetune_data/train \
+  --val_data_dir data/finetune_data/validation \
+  --test_data_dir data/finetune_data/test \
+  --vocab_path checkpoints/vocab.json \
+  --legacy_pretrained_checkpoint checkpoints/legacy-model-only.pt \
   --output_dir checkpoints
 ```
+
+## 검증
+
+Smoke test는 parser/tokenizer/dataset의 기본 동작과 teacher/classifier CPU forward shape를 확인합니다.
+
+```bash
+python -m unittest tests.test_data_pipeline tests.test_models -v
+```
+
+Training/data integrity test는 accumulation 잔여 update, scheduler/global-step 수, AMP overflow, DDP `no_sync`, checkpoint round trip·한 update 연속성·입력 hash 불일치 거부, fine-tune checkpoint lineage와 legacy strict load, file boundary, missing class, empty loader, deterministic manifest·안전한 overwrite 및 source/output 경로 분리 정책을 합성 입력으로 확인합니다.
+
+```bash
+python -m unittest \
+  tests.test_training_integrity \
+  tests.test_checkpoints \
+  tests.test_classification_integrity \
+  tests.test_data_preparation -v
+```
+
+전체 검사:
+
+```bash
+python -m compileall core models scripts utils tests
+python -m unittest discover -s tests -v
+```
+
+이 검사는 실제 데이터 학습이나 성능 재현을 대신하지 않습니다.
 
 ## Project lineage
 
@@ -106,10 +193,10 @@ python -m scripts.finetune \
 
 ## 검증 범위와 한계
 
-- CI와 로컬 smoke test는 합성 입력의 파싱·토큰화·모델 forward만 검사합니다.
+- CI와 로컬 검사는 합성 입력 기반 smoke/integrity test입니다.
 - 공개 데이터, 가중치, 실험 로그가 없으므로 정확도, F1, 지연 시간 또는 일반화 성능을 주장하지 않습니다.
-- CPU 단독 학습과 대규모 데이터 학습은 지원·검증된 실행 경로가 아닙니다.
-- 이 코드는 안전이 중요한 실제 차량 시스템에 바로 배포하기 위한 구현이 아닙니다.
+- CPU 테스트는 작은 단위 입력의 코드 경로 검증이며 CPU 대규모 학습 지원을 의미하지 않습니다.
+- 실제 차량 시스템에 바로 배포하기 위한 구현이 아닙니다.
 - 저장소에는 명시적인 소프트웨어 라이선스가 없습니다. 팀·원 코드 권리 확인 전에는 재사용 허가를 전제로 하지 마세요.
 
 ## References
